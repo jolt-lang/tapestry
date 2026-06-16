@@ -250,7 +250,25 @@
 
   (testing "unbounded parallelism"
     (is (= [2 3 4 5]
-           (sut/parallelly inc [1 2 3 4])))))
+           (sut/parallelly inc [1 2 3 4]))))
+
+  (testing "propagates errors with bounded parallelism over a seq"
+    (let [boom   (fn [x] (if (= x 3) (throw (ex-info "boom" {:x x})) (inc x)))
+          result (future (try
+                           (doall (sut/parallelly 2 boom [1 2 3 4 5]))
+                           ::no-throw
+                           (catch clojure.lang.ExceptionInfo e
+                             (ex-message e))))]
+      (is (= "boom" (deref result 5000 ::timed-out)))))
+
+  (testing "propagates errors with bounded parallelism over a stream"
+    (let [boom   (fn [x] (if (= x 3) (throw (ex-info "boom" {:x x})) (inc x)))
+          result (future (try
+                           (doall (s/stream->seq (sut/parallelly 2 boom (s/->source [1 2 3 4 5]))))
+                           ::no-throw
+                           (catch clojure.lang.ExceptionInfo e
+                             (ex-message e))))]
+      (is (= "boom" (deref result 5000 ::timed-out))))))
 
 (deftest locking-test
   (testing "locking works"

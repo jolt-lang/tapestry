@@ -432,7 +432,6 @@
        seq? (s/->source)
        true (s/map #(d/->deferred (fiber (f %))))
        true (s/buffer n)
-       true (s/realize-each)
        seq? (s/stream->seq)))))
 
 (defn send
