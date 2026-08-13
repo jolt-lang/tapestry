@@ -1,19 +1,5 @@
 {:paths ["src"]
- :pablo/config
- {:github       "teknql/tapestry"
-  :desc         "Loom for Clojure"
-  :target       :jar
-  :group-id     teknql
-  :artifact-id  tapestry
-  :license/name "MIT"
-  :license/url  "https://opensource.org/licenses/MIT"}
  :aliases
  {:test
   {:extra-paths ["test"]
-   :jvm-opts    ["--enable-preview"]
-   :main-opts   ["-m" "kaocha.runner"]
-   :extra-deps
-   {org.clojure/test.check {:mvn/version "1.1.1"}
-    lambdaisland/kaocha    {:mvn/version "1.87.1366"}}}}
- :deps
- {manifold/manifold {:mvn/version "0.4.3"}}}
+   :main-opts   ["-m" "tapestry.test-runner"]}}}

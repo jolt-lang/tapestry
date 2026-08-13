@@ -1,26 +1,15 @@
 (ns tapestry.core-test
   (:require [tapestry.core :as sut]
-            [clojure.test :refer [deftest testing is]]
-            [manifold.stream :as s]
-            [manifold.deferred :as d])
-  (:import [java.util.concurrent TimeoutException CancellationException CompletableFuture]
-           [java.lang InterruptedException]))
+            [clojure.core.async :as a]
+            [clojure.test :refer [deftest testing is]]))
 
-(defmacro with-global-error-handler
-  "Macro to install `f` as the global error handler for the duration of the `body`.
+;; core.async channels expose no `closed?`, so tests probe by attempting a
+;; blocking put: it returns false exactly when the channel is closed.
+(defn chan-closed? [ch]
+  (not (a/>!! ch ::probe)))
 
-  `f` is an arity 2 function that will be called with `thread` and `Throwable` when an
-  error is encountered"
-  [f & body]
-  `(let [existing-handler# (Thread/getDefaultUncaughtExceptionHandler)]
-     (try
-       (Thread/setDefaultUncaughtExceptionHandler
-         (reify Thread$UncaughtExceptionHandler
-           (uncaughtException [_# thread# e#]
-             (~f thread# e#))))
-       ~@body
-       (finally
-         (Thread/setDefaultUncaughtExceptionHandler existing-handler#)))))
+(defn drain [ch]
+  (a/<!! (a/into [] ch)))
 
 (deftest with-max-parallelism-test
   (testing "with-max-parallism limits parallel execution"
@@ -31,14 +20,14 @@
                           :max-seen (max max-seen (inc running))})]
       (is (= (range 100)
              (sut/with-max-parallelism 10
-               @(apply d/zip
-                       (mapv (fn [x]
-                               (sut/fiber
-                                 (swap! state update-state)
-                                 (Thread/sleep 1)
-                                 (swap! state update :running dec)
-                                 x))
-                             (range 100))))))
+               (->> (range 100)
+                    (mapv (fn [x]
+                            (sut/fiber
+                              (swap! state update-state)
+                              (Thread/sleep 1)
+                              (swap! state update :running dec)
+                              x)))
+                    (mapv deref)))))
 
       (is (= 100 (:count @state)))
       (is (zero? (:running @state)))
@@ -53,30 +42,28 @@
       (is (= (range 100)
              (sut/with-max-parallelism 10
                (flatten
-                 @(apply d/zip
-                         (mapv (fn [x]
-                                 (->>
-                                   (sut/with-max-parallelism 10
-                                     (->> (range 10 )
-                                          (mapv (fn [y]
-                                                  (sut/fiber
-                                                    (swap! state update-state)
-                                                    (Thread/sleep 2)
-                                                    (swap! state update :running dec)
-                                                    (+ (* 10 x) y))))
-                                          (apply d/zip)))))
-                               (range 10)))))))
+                 (->> (range 10)
+                      (mapv (fn [x]
+                              (sut/with-max-parallelism 10
+                                (->> (range 10)
+                                     (mapv (fn [y]
+                                             (sut/fiber
+                                               (swap! state update-state)
+                                               (Thread/sleep 2)
+                                               (swap! state update :running dec)
+                                               (+ (* 10 x) y))))
+                                     (mapv deref))))))))))
       (is (= 100 (:count @state)))
       (is (zero? (:running @state)))
       (is (<= 10 (:max-seen @state) 100)))))
 
 (deftest asyncly-test
   (testing "unbounded concurrency"
-    (is (=  [2 3 4]
-            (->> (s/->source [1 2 3])
-                 (sut/asyncly inc)
-                 (s/stream->seq)
-                 (sort)))))
+    (is (= [2 3 4]
+           (->> (a/to-chan [1 2 3])
+                (sut/asyncly inc)
+                (drain)
+                (sort)))))
 
   (testing "handling nil"
     (is (= '() (sut/asyncly inc nil))))
@@ -90,14 +77,14 @@
           update-state (fn [{:keys [running max-seen]}]
                          {:running  (inc running)
                           :max-seen (max (inc running) max-seen)})]
-      (is (=  (range 10)
-              (->> (s/->source (range 10))
-                   (sut/asyncly 3 #(do (swap! state update-state)
-                                       (Thread/sleep 2)
-                                       (swap! state update :running dec)
-                                       %))
-                   (s/stream->seq)
-                   (sort))))
+      (is (= (range 10)
+             (->> (a/to-chan (range 10))
+                  (sut/asyncly 3 #(do (swap! state update-state)
+                                      (Thread/sleep 2)
+                                      (swap! state update :running dec)
+                                      %))
+                  (drain)
+                  (sort))))
       (is (zero? (:running @state)))
       (is (<= (:max-seen @state) 3))))
 
@@ -114,9 +101,6 @@
         (sut/set-stream-error-handler! println))))
 
   (testing "unbounded - no new fibers dispatched after exception"
-    ;; The unbounded path cannot reliably interrupt already-running fibers (they are
-    ;; ephemeral and may not yet be tracked when the error fires). What it CAN guarantee
-    ;; is that no NEW fibers are dispatched once error* is realized.
     (sut/set-stream-error-handler! (fn [& _]))
     (try
       (let [call-count (atom 0)]
@@ -129,7 +113,7 @@
                            (throw (ex-info "boom" {})))
                          x)
                        (range 100)))))
-        ;; Far fewer than 100 items should have been dispatched
+        ;; Dispatch stops once the error fires: far fewer than 100 items run.
         (is (< @call-count 50)))
       (finally
         (sut/set-stream-error-handler! println))))
@@ -138,23 +122,23 @@
     (sut/set-stream-error-handler! (fn [& _]))
     (try
       (let [result (sut/asyncly #(throw (ex-info "oops" {}))
-                                (s/->source [1 2 3]))]
-        (s/stream->seq result) ;; drains cleanly, does not throw
+                                (a/to-chan [1 2 3]))]
+        (drain result)                       ;; drains cleanly, does not throw
         (Thread/sleep 20)
-        (is (s/closed? result)))
+        (is (chan-closed? result)))
       (finally
         (sut/set-stream-error-handler! println))))
 
   (testing "unbounded - stream mode closes source stream on error"
     (sut/set-stream-error-handler! (fn [& _]))
     (try
-      (let [source (s/stream)
-            _      (s/put! source 1)
-            _      (s/put! source 2)
-            result (sut/asyncly #(throw (ex-info "oops" {})) source)]
-        (s/stream->seq result)
-        (Thread/sleep 20)
-        (is (s/closed? source)))
+      (let [source (a/chan 2)]
+        (a/>!! source 1)
+        (a/>!! source 2)
+        (let [result (sut/asyncly #(throw (ex-info "oops" {})) source)]
+          (drain result)
+          (Thread/sleep 20)
+          (is (chan-closed? source))))
       (finally
         (sut/set-stream-error-handler! println))))
 
@@ -171,9 +155,6 @@
         (sut/set-stream-error-handler! println))))
 
   (testing "bounded - error not lost when other workers produce nil results (race condition)"
-    ;; This is the specific race: many workers return nil, one throws.
-    ;; The [:error e] tuple can be swallowed by stream close before the consumer sees it.
-    ;; The promise sentinel must catch it as a fallback.
     (sut/set-stream-error-handler! (fn [& _]))
     (try
       (is (thrown-with-msg?
@@ -184,10 +165,11 @@
       (finally
         (sut/set-stream-error-handler! println))))
 
-  (testing "bounded - exception interrupts blocked workers promptly"
-    ;; Workers block indefinitely on Thread/sleep; one throws immediately.
-    ;; The throwing worker must interrupt the sleeping ones so the call returns
-    ;; quickly. ::timeout means workers were not interrupted.
+  (testing "bounded - error propagates despite blocked workers"
+    ;; On Jolt, Thread/sleep cannot be forcibly interrupted, so blocked workers
+    ;; run to completion in the background while the error is reported promptly
+    ;; (the result stream closes on error). The call must throw well before the
+    ;; 30s sleeps would finish.
     (sut/set-stream-error-handler! (fn [& _]))
     (try
       (let [result* (promise)]
@@ -197,11 +179,11 @@
                                 (fn [x]
                                   (when (= x 0)
                                     (throw (ex-info "interrupted-boom" {})))
-                                  (Thread/sleep Long/MAX_VALUE))
+                                  (Thread/sleep 30000))
                                 (range 10)))
             (catch Exception e (deliver result* e))))
         (let [outcome (deref result* 10000 ::timeout)]
-          (is (not= ::timeout outcome) "workers were not interrupted — timed out after 10s")
+          (is (not= ::timeout outcome) "error did not propagate — timed out after 10s")
           (is (instance? clojure.lang.ExceptionInfo outcome))
           (is (re-find #"interrupted-boom" (ex-message outcome)))))
       (finally
@@ -212,32 +194,32 @@
     (try
       (let [result (sut/asyncly 2
                                 #(throw (ex-info "oops" {}))
-                                (s/->source [1 2 3]))]
-        (s/stream->seq result)
+                                (a/to-chan [1 2 3]))]
+        (drain result)
         (Thread/sleep 20)
-        (is (s/closed? result)))
+        (is (chan-closed? result)))
       (finally
         (sut/set-stream-error-handler! println)))))
 
 (deftest periodically-test
-  (let [s (sut/periodically 3 5 (constantly true))]
-    (is (nil? @(s/try-take! s 0))) ;; nothing available immediately
-    (is @(s/try-take! s 10)) ;; Wait a bit
-    (is (nil? @(s/try-take! s 0))) ;; Nothing should be available immediately
-    (is @(s/try-take! s 5)) ;; wait 5 millis for poll duration
-    (s/close! s)))
+  (let [ch (sut/periodically 3 5 (constantly true))]
+    (is (nil? (a/poll! ch)))                               ;; nothing immediately
+    (is (true? (first (a/alts!! [ch (a/timeout 50)]))))    ;; wait for first tick
+    (is (nil? (a/poll! ch)))                               ;; nothing immediately
+    (is (true? (first (a/alts!! [ch (a/timeout 20)]))))    ;; wait for next tick
+    (a/close! ch)))
 
 
 (deftest parallely-test
   (testing "stream mode"
     (is (= [2 3 4 5 6 7]
-           (->> (s/->source [1 2 3 4 5 6])
+           (->> (a/to-chan [1 2 3 4 5 6])
                 (sut/parallelly 2 inc)
-                (s/stream->seq))))
+                (drain))))
     (is (= [2 3 4]
-           (->> (s/->source [1 2 3])
+           (->> (a/to-chan [1 2 3])
                 (sut/parallelly inc)
-                (s/stream->seq)))))
+                (drain)))))
 
   (testing "handles nil"
     (is (= '() (sut/parallelly inc nil))))
@@ -264,7 +246,7 @@
   (testing "propagates errors with bounded parallelism over a stream"
     (let [boom   (fn [x] (if (= x 3) (throw (ex-info "boom" {:x x})) (inc x)))
           result (future (try
-                           (doall (s/stream->seq (sut/parallelly 2 boom (s/->source [1 2 3 4 5]))))
+                           (doall (drain (sut/parallelly 2 boom (a/to-chan [1 2 3 4 5]))))
                            ::no-throw
                            (catch clojure.lang.ExceptionInfo e
                              (ex-message e))))]
@@ -273,10 +255,10 @@
 (deftest locking-test
   (testing "locking works"
     (let [resource (atom false)
-          locked   (d/deferred)]
+          locked   (promise)]
       (sut/fiber
         (locking resource
-          (d/success! locked true)
+          (deliver locked true)
           (Thread/sleep 10)
           (reset! resource true)))
       @locked
@@ -284,19 +266,18 @@
         (is (true? @resource))))))
 
 (deftest fiber-error-test
-  (let [die?              (promise)
-        err               (ex-info "Boom" {})
-        err-handler-call* (atom nil)]
-    (with-global-error-handler
-      #(reset! err-handler-call* %&)
-      (let [f (sut/fiber
-                @die?
-                (throw err))]
-        (is (nil? (sut/fiber-error f)))
-        (deliver die? true)
-        (Thread/sleep 10) ;; Let the fiber die
-        (is (some? (sut/fiber-error f)))
-        (is (some? @err-handler-call*))))))
+  (testing "a fiber that throws records its error"
+    (let [die? (promise)
+          err  (ex-info "Boom" {})
+          f    (sut/fiber
+                 @die?
+                 (throw err))]
+      (is (nil? (sut/fiber-error f)))
+      (deliver die? true)
+      (Thread/sleep 20)                       ;; let the fiber die
+      (is (some? (sut/fiber-error f)))
+      (is (sut/errored? f))
+      (is (thrown? clojure.lang.ExceptionInfo @f)))))
 
 (deftest pfor-test
   (testing "works"
@@ -306,82 +287,80 @@
     (is (realized? (sut/pfor [x (range 3)] (inc x))))))
 
 (deftest interrupt-test
-  (let [f (sut/fiber (Thread/sleep 10000))]
-    (sut/interrupt! f)
-    (is (thrown? InterruptedException @f)))
-  (let [f (sut/fiber (try
-                       (Thread/sleep 10000)
-                       (catch InterruptedException _
-                         :handled)))]
-    (sut/interrupt! f)
-    (is (= :handled @f))))
+  (testing "interrupt! cancels the fiber's result"
+    (let [f (sut/fiber (Thread/sleep 10000))]
+      (sut/interrupt! f)
+      (is (thrown? clojure.lang.ExceptionInfo @f))
+      (is (sut/errored? f))))
+  (testing "interrupt! on an already-completed fiber is a no-op"
+    (let [f (sut/fiber :done)]
+      (is (= :done @f))                      ;; wait for completion
+      (sut/interrupt! f)
+      (is (= :done @f)))))                    ;; result unchanged
 
 (deftest cancel-interrupts-thread-test
-  (testing "cancelling the CompletableFuture interrupts the virtual thread"
-    (let [f (sut/fiber (Thread/sleep 10000))]
-      (.cancel ^CompletableFuture (.future f) true)
+  (testing "interrupting a running fiber marks it errored"
+    (let [f (sut/fiber (Thread/sleep 30000))]
       (Thread/sleep 50)
-      (is (not (sut/alive? f)))))
-  (testing "cancel on already-completed fiber is a no-op"
+      (sut/interrupt! f)
+      (is (sut/errored? f))
+      (is (thrown? clojure.lang.ExceptionInfo @f))))
+  (testing "interrupt on already-completed fiber leaves the result intact"
     (let [f (sut/fiber :done)]
-      @f ;; wait for completion
-      (is (false? (.cancel ^CompletableFuture (.future f) true)))
+      (is (= :done @f))
+      (sut/interrupt! f)
       (is (= :done @f)))))
 
 (deftest alive?-test
-  (let [f (sut/fiber (Thread/sleep 100))]
-    (is (sut/alive? f))
-    (sut/interrupt! f)
-    (Thread/sleep 10) ;; Let the interrupt happen
-    (is (not (sut/alive? f)))))
+  (testing "a fiber is alive while its body runs and dead once it returns"
+    (let [f (sut/fiber (Thread/sleep 50))]
+      (Thread/sleep 10)
+      (is (sut/alive? f))
+      @f
+      (is (not (sut/alive? f))))))
 
 (deftest timeout!-test
   (testing "simple timeout"
-    (let [f (sut/fiber (Thread/sleep 1000))]
+    (let [f (sut/fiber (Thread/sleep 30000))]
       (sut/timeout! f 10)
-      (is (thrown? TimeoutException @f))
-      (Thread/sleep 10) ;; Let the interrupt be thrown
-      (is (not (sut/alive? f)))))
+      (is (thrown? clojure.lang.ExceptionInfo @f))
+      (is (sut/errored? f))))
   (testing "binding-based timeout"
     (let [f (sut/with-timeout 10
-              (sut/fiber (Thread/sleep 1000)))]
-      (is (thrown? TimeoutException @f))))
+               (sut/fiber (Thread/sleep 30000)))]
+      (is (thrown? clojure.lang.ExceptionInfo @f))))
 
   (testing "binding and explicit defaults to explicit"
     (let [f (sut/with-timeout 100
-              (sut/fiber (Thread/sleep 10000)))]
+               (sut/fiber (Thread/sleep 30000)))]
       (is (= :explicit
              @(sut/timeout! f 10 :explicit)))))
 
   (testing "default value"
-    (let [f (sut/timeout! (sut/fiber (Thread/sleep 100))
+    (let [f (sut/timeout! (sut/fiber (Thread/sleep 30000))
                           10
                           :default)]
-      (is (= :default @f))
-      (Thread/sleep 10)
-      (is (not (sut/alive? f))))))
+      (is (= :default @f)))))
 
-(deftest IDeferred-test
-  (testing "can be used with manifold.streams"
-    (is (= [2 4 6]
-           (->> (s/->source [1 2 3])
-                (s/map #(sut/fiber (* % 2)))
-                (s/realize-each)
-                (s/stream->seq)))))
-  (testing "can be used with manifold.deferred/chain'"
-    (let [success? (atom false)]
-      @(d/chain' (sut/fiber true) (partial reset! success?))
-      (is @success?)))
-  (testing "onRealized fires on-success for nil result"
-    (let [result (promise)
-          f      (sut/fiber nil)]
-      (d/on-realized f #(deliver result [:success %]) #(deliver result [:error %]))
-      (is (= [:success nil] (deref result 1000 :timeout)))))
-  (testing "onRealized fires on-success for false result"
-    (let [result (promise)
-          f      (sut/fiber false)]
-      (d/on-realized f #(deliver result [:success %]) #(deliver result [:error %]))
-      (is (= [:success false] (deref result 1000 :timeout))))))
+(deftest fiber-deref-protocols-test
+  (testing "deref returns the body value"
+    (is (= 7 @(sut/fiber (+ 3 4)))))
+  (testing "nil and false results are preserved"
+    (is (nil? @(sut/fiber nil)))
+    (is (false? @(sut/fiber false))))
+  (testing "IPending: realized transitions from false to true"
+    (let [gate (promise)
+          f    (sut/fiber @gate :done)]
+      (is (not (realized? f)))
+      (deliver gate true)
+      @f
+      (is (realized? f))))
+  (testing "IBlockingDeref returns default on timeout"
+    (let [gate (promise)
+          f    (sut/fiber @gate)]
+      (is (= :timed-out (deref f 10 :timed-out)))
+      (deliver gate :late)
+      (is (= :late @f)))))
 
 (deftest send-test
   (let [a (agent 0)]

@@ -1,6 +1,5 @@
 (ns tapestry.experimental-test
   (:require [tapestry.experimental :as sut]
-            [tapestry.experimental.scope :as scope]
             [tapestry.core :as tc]
             [clojure.test :refer [deftest testing is]]))
 
@@ -16,23 +15,18 @@
     (is (= 42 (sut/with-scope {} 42)))))
 
 (deftest with-scope-shutdown-on-failure-test
-  (testing "error in one fiber interrupts siblings"
+  (testing "error in one fiber cancels siblings and propagates"
     (tc/set-stream-error-handler! (fn [& _]))
     (try
-      (let [interrupted? (promise)]
+      (let [slow-ref (atom nil)]
         (is (thrown-with-msg?
               clojure.lang.ExceptionInfo #"boom"
               (sut/with-scope {:shutdown :on-failure}
-                (let [a (tc/fiber
-                          (try
-                            (Thread/sleep 10000)
-                            (catch InterruptedException _
-                              (deliver interrupted? true))))
-                      b (tc/fiber
-                          (throw (ex-info "boom" {})))]
-                  [@a @b]))))
-        (is (= true (deref interrupted? 1000 :timeout))
-            "sibling fiber should have been interrupted"))
+                (reset! slow-ref (tc/fiber (Thread/sleep 30000)))
+                (tc/fiber (throw (ex-info "boom" {}))))))
+        ;; The sibling's result was cancelled even though its body could not be
+        ;; forcibly stopped on Jolt.
+        (is (tc/errored? @slow-ref)))
       (finally
         (tc/set-stream-error-handler! println))))
 
@@ -45,28 +39,28 @@
             :body-result)))))
 
 (deftest with-scope-shutdown-on-success-test
-  (testing "first success interrupts siblings"
-    (let [interrupted? (promise)
-          started?     (promise)]
+  (testing "first success cancels siblings"
+    (let [slow-ref (atom nil)]
       (sut/with-scope {:shutdown :on-success}
-        (tc/fiber
-          (try
-            (deliver started? true)
-            (Thread/sleep 10000)
-            (catch InterruptedException _
-              (deliver interrupted? true))))
-        ;; Wait for slow fiber to start before spawning the winner
-        @started?
+        (reset! slow-ref (tc/fiber (Thread/sleep 30000)))
         (tc/fiber :fast-result))
-      (is (= true (deref interrupted? 1000 :timeout))
-          "slow sibling should have been interrupted"))))
+      ;; On Jolt the slow body keeps running, but its result is cancelled.
+      (is (tc/errored? @slow-ref))))
+
+  (testing "the first successful result is recorded"
+    (let [scope-ref (atom nil)]
+      (sut/with-scope {:shutdown :on-success}
+        (reset! scope-ref tc/*scope*)
+        (tc/fiber (Thread/sleep 30000))
+        (tc/fiber :fast-result))
+      (is (= :fast-result (deref (:first-result @scope-ref) 1000 :timeout))))))
 
 (deftest with-scope-timeout-test
-  (testing "timeout applies to fibers in the scope"
-    (is (thrown? java.util.concurrent.TimeoutException
-                (sut/with-scope {:timeout 50 :shutdown :on-failure}
-                  (let [f (tc/fiber (Thread/sleep 10000))]
-                    @f))))))
+  (testing "timeout cancels a fiber in the scope"
+    (is (thrown? clojure.lang.ExceptionInfo
+                 (sut/with-scope {:timeout 50 :shutdown :on-failure}
+                   (let [f (tc/fiber (Thread/sleep 30000))]
+                     @f))))))
 
 (deftest with-scope-max-parallelism-test
   (testing "max-parallelism limits concurrent fibers"
@@ -114,48 +108,21 @@
                     (swap! inner-count (fn [_] (count @(:fibers tc/*scope*))))
                     (let [x (tc/fiber 10)
                           y (tc/fiber 20)]
-                      ;; inner scope should have its own fibers
                       (+ @x @y))))
               b (tc/fiber 3)]
           (is (= 33 (+ @a @b)))))
-      ;; outer scope should only see its own fibers (a and b)
-      ;; inner scope should see its own (x and y)
       (is (= 0 @outer-count) "outer scope had no fibers before a and b")
       (is (<= @inner-count 2) "inner scope should track its own fibers"))))
-
-(deftest with-scope-thread-termination-test
-  (testing "scope guarantees threads are fully terminated on exit"
-    (let [threads (atom [])]
-      (sut/with-scope {:shutdown :on-failure}
-        (dotimes [_ 5]
-          (tc/fiber
-            (swap! threads conj (Thread/currentThread))
-            (Thread/sleep 5))))
-      ;; After scope exits, ALL threads must be dead
-      (is (every? #(not (.isAlive ^Thread %)) @threads)
-          "all fiber threads should be terminated after scope exits"))))
 
 (deftest alts-test
   (testing "returns first successful result"
     (is (= :fast
            (sut/alts
-             (do (Thread/sleep 10000) :slow)
+             (do (Thread/sleep 30000) :slow)
              :fast))))
-
-  (testing "interrupts losers"
-    (let [interrupted? (promise)]
-      (sut/alts
-        (do (try
-              (Thread/sleep 10000)
-              (catch InterruptedException _
-                (deliver interrupted? true)))
-            :slow)
-        :fast)
-      (is (= true (deref interrupted? 1000 :timeout))
-          "slow branch should have been interrupted")))
 
   (testing "with options map"
     (is (= :result
            (sut/alts {:timeout 5000}
              :result
-             (Thread/sleep 10000))))))
+             (Thread/sleep 30000))))))

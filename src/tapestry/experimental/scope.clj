@@ -4,10 +4,9 @@
   Provides `with-scope` for structured lifecycle management of fibers,
   unifying timeout, max-parallelism, and shutdown policies into a single
   scope construct."
-  (:require [tapestry.core :as tc])
-  (:import [java.util.concurrent Semaphore CompletableFuture]
-           [java.util.function BiConsumer]
-           [java.lang VirtualThread]))
+  (:require [tapestry.core :as tc]
+            [clojure.core.async :as a])
+  (:import [clojure.lang PersistentQueue]))
 
 (set! *warn-on-reflection* true)
 
@@ -20,63 +19,66 @@
 (defn ^:no-doc make-scope
   "Create a new scope with the given shutdown policy."
   [shutdown-policy]
-  (->Scope shutdown-policy (atom []) (promise) (promise)))
+  (->Scope shutdown-policy (atom PersistentQueue/EMPTY) (promise) (promise)))
+
+(defn- deliver-first
+  "Deliver `v` to `p` only if it has not already been delivered."
+  [p v]
+  (when-not (realized? p) (deliver p v)))
+
+(defn- interrupt-siblings
+  "Interrupt every other alive fiber in the scope."
+  [scope self]
+  (doseq [f @(:fibers scope)]
+    (when (and (not (identical? f self)) (tc/alive? f))
+      (tc/interrupt! f))))
 
 (defn ^:no-doc register-fiber!
-  "Register a fiber with the scope and wire up shutdown policy handlers."
-  [^Scope scope fiber]
-  (swap! (:fibers scope) conj fiber)
-  ;; If the scope has already been shut down (an earlier fiber completed before
-  ;; this one was registered), interrupt immediately.
+  "Register a fiber with the scope. Completion is handled by `notify-fiber!`,
+  wired up via `*scope-notify!*` (Jolt promises are not watchable)."
+  [scope fiber]
+  (swap! (:fibers scope)
+         #(reduce conj PersistentQueue/EMPTY (conj (vec %) fiber)))
+  ;; If the scope has already shut down (an earlier fiber completed before this
+  ;; one was registered), interrupt immediately.
   (case (:shutdown-policy scope)
-    :on-success (when (realized? (:first-result scope))
-                  (tc/interrupt! fiber))
-    :on-failure (when (realized? (:first-error scope))
-                  (tc/interrupt! fiber))
-    nil)
-  (let [^CompletableFuture cf (.future ^tapestry.core.Fiber fiber)]
-    (.whenComplete cf
-                   (reify BiConsumer
-                     (accept [_ res ex]
-                       (case (:shutdown-policy scope)
-                         :on-failure
-                         (when ex
-                           (deliver (:first-error scope) ex)
-                           ;; Interrupt all sibling fibers
-                           (doseq [^tapestry.core.Fiber f @(:fibers scope)]
-                             (when (and (not (identical? f fiber))
-                                        (tc/alive? f))
-                               (tc/interrupt! f))))
+    :on-success (when (realized? (:first-result scope)) (tc/interrupt! fiber))
+    :on-failure (when (realized? (:first-error scope))  (tc/interrupt! fiber))
+    nil))
 
-                         :on-success
-                         (when-not ex
-                           (deliver (:first-result scope) res)
-                           ;; Interrupt all sibling fibers
-                           (doseq [^tapestry.core.Fiber f @(:fibers scope)]
-                             (when (and (not (identical? f fiber))
-                                        (tc/alive? f))
-                               (tc/interrupt! f))))
+(defn ^:no-doc notify-fiber!
+  "Called by a fiber (via `*scope-notify!*`) when it completes, with the fiber
+  and its `[:ok v]` / `[:err Throwable]` outcome."
+  [scope fiber outcome]
+  (let [[tag val] outcome]
+    (case (:shutdown-policy scope)
+      :on-failure
+      (when (= :err tag)
+        (deliver-first (:first-error scope) val)
+        (interrupt-siblings scope fiber))
 
-                         ;; No shutdown policy — do nothing
-                         nil))))))
+      :on-success
+      (when (= :ok tag)
+        (deliver-first (:first-result scope) val)
+        (interrupt-siblings scope fiber))
+
+      nil)))
 
 (defn ^:no-doc await-all!
-  "Wait for all registered fibers to fully terminate (thread join, not just CF completion)."
-  [^Scope scope]
+  "Wait for every registered fiber to complete (deref its result promise)."
+  [scope]
   (doseq [^tapestry.core.Fiber fiber @(:fibers scope)]
-    (let [^VirtualThread vt (.virtualThread fiber)]
-      (.join vt))))
+    @(.result fiber)))
 
 (defn ^:no-doc shutdown-all!
   "Interrupt all fibers that are still alive in the scope."
-  [^Scope scope]
-  (doseq [^tapestry.core.Fiber fiber @(:fibers scope)]
-    (when (tc/alive? fiber)
-      (tc/interrupt! fiber))))
+  [scope]
+  (doseq [fiber @(:fibers scope)]
+    (when (tc/alive? fiber) (tc/interrupt! fiber))))
 
 (defn ^:no-doc throw-if-failed!
   "If the scope has a recorded error and the policy is :on-failure, throw it."
-  [^Scope scope]
+  [scope]
   (when (= :on-failure (:shutdown-policy scope))
     (let [err (:first-error scope)]
       (when (realized? err)
@@ -93,11 +95,11 @@
     :timeout         - Timeout in millis or a Duration applied to all fibers (optional)
     :max-parallelism - Maximum number of fibers running in parallel (optional)
 
-  All fibers created with `tapestry.core/fiber` within the body are automatically
-  registered with the scope.
+  All fibers created with `tapestry.core/fiber` within the body are
+  automatically registered with the scope.
 
   On scope exit:
-    - All registered fibers are awaited (thread join, not just CF completion)
+    - All registered fibers are awaited (their results settle)
     - If :shutdown is :on-failure and any fiber failed, the error is propagated
     - If :shutdown is :on-success, the first successful result is available
 
@@ -112,20 +114,31 @@
          timeout#   (:timeout opts#)
          max-par#   (:max-parallelism opts#)
          scope#     (make-scope shutdown#)
-         semaphore# (when max-par# (Semaphore. (int max-par#)))
-         register#  (fn [fiber#] (register-fiber! scope# fiber#))]
+         register#  (fn [fiber#] (register-fiber! scope# fiber#))
+         notify#    (fn [fiber# outcome#] (notify-fiber! scope# fiber# outcome#))
+         sem#       (when max-par#
+                      (let [n# (int max-par#)
+                            c# (a/chan n#)]
+                        (dotimes [_# n#] (a/>!! c# :permit))
+                        c#))]
      (binding [tc/*scope*           scope#
                tc/*scope-register!* register#
-               tc/*local-semaphore* (or semaphore# tc/*local-semaphore*)
+               tc/*scope-notify!*   notify#
                tc/*local-timeout*   (or timeout# tc/*local-timeout*)]
-       (try
-         (let [result# (do ~@body)]
-           (await-all! scope#)
-           (throw-if-failed! scope#)
-           result#)
-         (catch Throwable t#
-           (shutdown-all! scope#)
-           (await-all! scope#)
-           (throw t#))))))
-
-
+       (binding [tc/*local-semaphore* (or sem# tc/*local-semaphore*)]
+         (try
+           (let [result# (do ~@body)]
+             (await-all! scope#)
+             (throw-if-failed! scope#)
+             result#)
+           (catch Throwable t#
+             (shutdown-all! scope#)
+             (await-all! scope#)
+             ;; If the scope recorded a real failure, prefer it: the caught
+             ;; throwable is often just the cascade from derefing a sibling
+             ;; whose result was cancelled (an interrupt/timeout), which would
+             ;; otherwise mask the original error.
+             (if (and (= :on-failure shutdown#)
+                      (realized? (:first-error scope#)))
+               (throw @(:first-error scope#))
+               (throw t#))))))))

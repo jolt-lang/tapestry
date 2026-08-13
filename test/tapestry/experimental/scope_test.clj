@@ -40,26 +40,17 @@
       (is (nil? tc/*scope*)))))
 
 (deftest shutdown-on-failure-test
-  (testing "error in one fiber interrupts siblings"
+  (testing "error in one fiber cancels siblings"
     (tc/set-stream-error-handler! (fn [& _]))
     (try
-      (let [interrupted? (promise)
-            started?     (promise)]
+      (let [slow-ref (atom nil)]
         (is (thrown-with-msg?
               clojure.lang.ExceptionInfo #"boom"
               (sut/with-scope {:shutdown :on-failure}
-                (let [a (tc/fiber
-                          (try
-                            (deliver started? true)
-                            (Thread/sleep 10000)
-                            (catch InterruptedException _
-                              (deliver interrupted? true))))
-                      _ @started?
-                      b (tc/fiber
-                          (throw (ex-info "boom" {})))]
-                  [@a @b]))))
-        (is (= true (deref interrupted? 1000 :timeout))
-            "sibling fiber should have been interrupted"))
+                (reset! slow-ref (tc/fiber (Thread/sleep 30000)))
+                (tc/fiber (throw (ex-info "boom" {}))))))
+        ;; The sibling's result is cancelled on Jolt (body not forcibly stopped).
+        (is (tc/errored? @slow-ref)))
       (finally
         (tc/set-stream-error-handler! println))))
 
@@ -73,22 +64,21 @@
 
   (testing "first error wins when multiple fibers fail"
     (tc/set-stream-error-handler! (fn [& _]))
-    (try
-      (let [started? (promise)]
-        (try
-          (sut/with-scope {:shutdown :on-failure}
-            (tc/fiber
-              (deliver started? true)
-              (throw (ex-info "first" {})))
-            @started?
-            (tc/fiber
-              (Thread/sleep 10)
-              (throw (ex-info "second" {})))
-            (Thread/sleep 100))
-          (catch clojure.lang.ExceptionInfo e
-            (is (= "first" (.getMessage e))))))
-      (finally
-        (tc/set-stream-error-handler! println))))
+    (let [started? (promise)]
+      (try
+        (sut/with-scope {:shutdown :on-failure}
+          (tc/fiber
+            (deliver started? true)
+            (throw (ex-info "first" {})))
+          @started?
+          (tc/fiber
+            (Thread/sleep 10)
+            (throw (ex-info "second" {})))
+          (Thread/sleep 100))
+        (catch clojure.lang.ExceptionInfo e
+          (is (= "first" (ex-message e))))
+        (finally
+          (tc/set-stream-error-handler! println)))))
 
   (testing "successful scope with :on-failure returns body result"
     (is (= {:a 1 :b 2}
@@ -98,57 +88,37 @@
                {:a @a :b @b}))))))
 
 (deftest shutdown-on-success-test
-  (testing "first success interrupts siblings"
-    (let [interrupted? (promise)
-          started?     (promise)]
+  (testing "first success cancels siblings"
+    (let [slow-ref (atom nil)]
       (sut/with-scope {:shutdown :on-success}
-        (tc/fiber
-          (try
-            (deliver started? true)
-            (Thread/sleep 10000)
-            (catch InterruptedException _
-              (deliver interrupted? true))))
-        @started?
+        (reset! slow-ref (tc/fiber (Thread/sleep 30000)))
         (tc/fiber :fast-result))
-      (is (= true (deref interrupted? 1000 :timeout))
-          "slow sibling should have been interrupted")))
+      (is (tc/errored? @slow-ref))))
 
-  (testing "multiple slow siblings are all interrupted"
-    (let [interrupt-count (atom 0)
-          all-started?    (java.util.concurrent.CountDownLatch. 3)]
+  (testing "the first successful result is recorded"
+    (let [scope-ref (atom nil)]
       (sut/with-scope {:shutdown :on-success}
-        (dotimes [_ 3]
-          (tc/fiber
-            (try
-              (.countDown all-started?)
-              (Thread/sleep 10000)
-              (catch InterruptedException _
-                (swap! interrupt-count inc)))))
-        (.await all-started?)
+        (reset! scope-ref tc/*scope*)
+        (tc/fiber (Thread/sleep 30000))
         (tc/fiber :winner))
-      (is (= 3 @interrupt-count)
-          "all slow siblings should have been interrupted"))))
+      (is (= :winner (deref (:first-result @scope-ref) 1000 :timeout))))))
 
 (deftest scope-timeout-test
   (testing "timeout applies to fibers spawned in the scope"
-    (is (thrown? java.util.concurrent.TimeoutException
-                (sut/with-scope {:timeout 50 :shutdown :on-failure}
-                  (let [f (tc/fiber (Thread/sleep 10000))]
-                    @f)))))
+    (is (thrown? clojure.lang.ExceptionInfo
+                 (sut/with-scope {:timeout 50 :shutdown :on-failure}
+                   (let [f (tc/fiber (Thread/sleep 30000))]
+                     @f)))))
 
-  (testing "timeout interrupts the fiber's thread"
-    (let [interrupted? (promise)]
+  (testing "timeout cancels the fiber's result"
+    (let [fib-ref (atom nil)]
       (try
         (sut/with-scope {:timeout 50 :shutdown :on-failure}
-          (let [f (tc/fiber
-                    (try
-                      (Thread/sleep 10000)
-                      (catch InterruptedException _
-                        (deliver interrupted? true))))]
-            @f))
+          (reset! fib-ref (tc/fiber (Thread/sleep 30000)))
+          ;; give the timeout a chance to fire before the scope returns
+          (Thread/sleep 80))
         (catch Exception _))
-      (is (= true (deref interrupted? 1000 :timeout))
-          "timed out fiber should have been interrupted"))))
+      (is (tc/errored? @fib-ref)))))
 
 (deftest scope-max-parallelism-test
   (testing "max-parallelism limits concurrent fibers"
@@ -188,19 +158,15 @@
   (testing "shutdown + timeout: timeout triggers shutdown"
     (tc/set-stream-error-handler! (fn [& _]))
     (try
-      (let [interrupted? (promise)]
+      (let [slow-ref (atom nil)]
         (try
           (sut/with-scope {:timeout 50 :shutdown :on-failure}
-            (let [a (tc/fiber
-                      (try
-                        (Thread/sleep 10000)
-                        (catch InterruptedException _
-                          (deliver interrupted? true))))
-                  b (tc/fiber (Thread/sleep 10000))]
-              [@a @b]))
+            (reset! slow-ref (tc/fiber (Thread/sleep 30000)))
+            (tc/fiber (Thread/sleep 30000))
+            (Thread/sleep 80))
           (catch Exception _))
-        (is (= true (deref interrupted? 1000 :timeout))
-            "timeout should trigger shutdown and interrupt siblings"))
+        (is (tc/errored? @slow-ref)
+            "timeout should cancel sibling results"))
       (finally
         (tc/set-stream-error-handler! println)))))
 
@@ -237,36 +203,6 @@
       (finally
         (tc/set-stream-error-handler! println)))))
 
-(deftest scope-thread-termination-test
-  (testing "scope guarantees threads are fully terminated on exit"
-    (let [threads (atom [])]
-      (sut/with-scope {}
-        (dotimes [_ 5]
-          (tc/fiber
-            (swap! threads conj (Thread/currentThread))
-            (Thread/sleep 5))))
-      (is (every? #(not (.isAlive ^Thread %)) @threads)
-          "all fiber threads should be terminated after scope exits")))
-
-  (testing "threads terminated even after error shutdown"
-    (tc/set-stream-error-handler! (fn [& _]))
-    (try
-      (let [threads (atom [])]
-        (try
-          (sut/with-scope {:shutdown :on-failure}
-            (dotimes [_ 3]
-              (tc/fiber
-                (swap! threads conj (Thread/currentThread))
-                (Thread/sleep 10000)))
-            (Thread/sleep 20)
-            (tc/fiber (throw (ex-info "die" {})))
-            (Thread/sleep 100))
-          (catch Exception _))
-        (is (every? #(not (.isAlive ^Thread %)) @threads)
-            "all fiber threads should be terminated even after error shutdown"))
-      (finally
-        (tc/set-stream-error-handler! println)))))
-
 (deftest scope-no-shutdown-policy-test
   (testing "scope without shutdown policy still awaits fibers"
     (let [completed (atom 0)]
@@ -280,8 +216,6 @@
   (testing "scope without shutdown policy ignores fiber errors"
     (tc/set-stream-error-handler! (fn [& _]))
     (try
-      ;; No :shutdown policy — error in fiber is not propagated at scope exit
-      ;; (but derefing the fiber would still throw)
       (is (= :ok
              (sut/with-scope {}
                (tc/fiber (throw (ex-info "ignored" {})))
@@ -292,18 +226,11 @@
 
 (deftest scope-body-exception-shuts-down-fibers-test
   (testing "exception in body (not from fiber) shuts down all fibers"
-    (let [interrupted? (promise)
-          started?     (promise)]
+    (let [slow-ref (atom nil)]
       (try
         (sut/with-scope {}
-          (tc/fiber
-            (try
-              (deliver started? true)
-              (Thread/sleep 10000)
-              (catch InterruptedException _
-                (deliver interrupted? true))))
-          @started?
+          (reset! slow-ref (tc/fiber (Thread/sleep 30000)))
           (throw (ex-info "body-error" {})))
         (catch Exception _))
-      (is (= true (deref interrupted? 1000 :timeout))
-          "fibers should be interrupted when body throws"))))
+      (is (tc/errored? @slow-ref)
+          "fibers should be cancelled when body throws"))))

@@ -1,278 +1,147 @@
 (ns tapestry.queue
-  (:import [java.util ArrayDeque Deque LinkedList]
-           [java.util.concurrent CompletableFuture TimeUnit]
-           [java.util.concurrent.locks ReentrantLock Condition]))
+  "Portable blocking queue over `clojure.core.async`.
 
-;; A `Parcel` wraps an item handed off through a synchronous (rendezvous)
-;; queue. The putter parks until `delivered?` flips to true, set by the
-;; taker that pulls the parcel from the deque. Identity (`instance? Parcel`)
-;; distinguishes wrapped from raw items.
-(deftype ^:private Parcel [item ^clojure.lang.Volatile delivered?])
+  Replaces the JVM `java.util.concurrent.locks` implementation. A queue is
+  backed by a core.async channel — unbuffered for synchronous (rendezvous)
+  queues, buffered for bounded and unbounded ones — so blocking and timeouts
+  delegate to the channel. An `items` mirror atom provides the point-in-time
+  snapshot; it is approximate under concurrency, which matches the documented
+  'inspection and debugging' contract."
+  (:require [clojure.core.async :as a])
+  (:import [clojure.lang PersistentQueue]))
 
-(definterface ^:private IQueue
-  (^Object  putValue     [item])
-  (^Object  tryPutValue  [item ^long timeout-ms timeout-val])
-  (^Object  takeValue    [])
-  (^Object  tryTakeValue [^long timeout-ms timeout-val])
-  (^boolean closeQueue   []))
+(set! *warn-on-reflection* true)
 
-(defn- -deadline-nanos ^long [^long timeout-ms]
-  (+ (System/nanoTime) (.toNanos TimeUnit/MILLISECONDS timeout-ms)))
-
-(deftype Queue [^ReentrantLock     lock
-                ^Condition         not-empty
-                ^Condition         not-full
-                ^Condition         delivered   ;; sync mode only
-                ^Deque             items
-                ^long              capacity
-                sync?
-                ^CompletableFuture closed?*]
-  IQueue
-  (putValue [_ item]
-    (.lockInterruptibly lock)
-    (try
-      (loop []
-        (cond
-          (.isDone closed?*)
-          false
-
-          (< (.size items) capacity)
-          (if sync?
-            (let [delivered? (volatile! false)
-                  parcel     (Parcel. item delivered?)]
-              (.addLast items parcel)
-              (.signal not-empty)
-              (loop []
-                (cond
-                  @delivered?        true
-                  (.isDone closed?*) (do (.remove items parcel)
-                                         (.signal not-full)
-                                         false)
-                  :else              (do (.await delivered)
-                                         (recur)))))
-            (do (.addLast items item)
-                (.signal not-empty)
-                true))
-
-          :else
-          (do (.await not-full)
-              (recur))))
-      (finally (.unlock lock))))
-
-  (tryPutValue [_ item timeout-ms timeout-val]
-    (let [deadline (-deadline-nanos timeout-ms)]
-      (.lockInterruptibly lock)
-      (try
-        (loop []
-          (cond
-            (.isDone closed?*)
-            false
-
-            (< (.size items) capacity)
-            (if sync?
-              (let [delivered? (volatile! false)
-                    parcel     (Parcel. item delivered?)]
-                (.addLast items parcel)
-                (.signal not-empty)
-                (loop []
-                  (cond
-                    @delivered?
-                    true
-
-                    (.isDone closed?*)
-                    (do (.remove items parcel)
-                        (.signal not-full)
-                        false)
-
-                    :else
-                    (let [remain (- deadline (System/nanoTime))]
-                      (if (pos? remain)
-                        (do (.awaitNanos delivered remain)
-                            (recur))
-                        (do (.remove items parcel)
-                            (.signal not-full)
-                            timeout-val))))))
-              (do (.addLast items item)
-                  (.signal not-empty)
-                  true))
-
-            :else
-            (let [remain (- deadline (System/nanoTime))]
-              (if (pos? remain)
-                (do (.awaitNanos not-full remain)
-                    (recur))
-                timeout-val))))
-        (finally (.unlock lock)))))
-
-  (takeValue [_]
-    (.lockInterruptibly lock)
-    (try
-      (loop []
-        (cond
-          ;; Items first, always — drains even when closed.
-          (not (.isEmpty items))
-          (let [head (.pollFirst items)]
-            (.signal not-full)
-            (if (instance? Parcel head)
-              (let [^Parcel p head]
-                (vreset! (.-delivered? p) true)
-                (.signal delivered)
-                (.-item p))
-              head))
-
-          (.isDone closed?*) nil
-
-          :else
-          (do (.await not-empty)
-              (recur))))
-      (finally (.unlock lock))))
-
-  (tryTakeValue [_ timeout-ms timeout-val]
-    (let [deadline (-deadline-nanos timeout-ms)]
-      (.lockInterruptibly lock)
-      (try
-        (loop []
-          (cond
-            (not (.isEmpty items))
-            (let [head (.pollFirst items)]
-              (.signal not-full)
-              (if (instance? Parcel head)
-                (let [^Parcel p head]
-                  (vreset! (.-delivered? p) true)
-                  (.signal delivered)
-                  (.-item p))
-                head))
-
-            (.isDone closed?*) nil
-
-            :else
-            (let [remain (- deadline (System/nanoTime))]
-              (if (pos? remain)
-                (do (.awaitNanos not-empty remain)
-                    (recur))
-                timeout-val))))
-        (finally (.unlock lock)))))
-
-  (closeQueue [_]
-    (.lock lock)
-    (try
-      (when-not (.isDone closed?*)
-        (.complete closed?* true)
-        (.signalAll not-empty)
-        (.signalAll not-full)
-        (.signalAll delivered))
-      (finally (.unlock lock)))
-    true))
-
-;; ---- Public API ----
+(deftype ^:no-doc Queue
+    [chan          ;; core.async channel carrying the items
+     items*        ;; atom: PersistentQueue mirroring in-flight items (snapshot)
+     closed*       ;; atom: boolean, set by close!
+     close-promise ;; clojure.core/promise: delivered on close!
+     sync?         ;; boolean: rendezvous (unbuffered) mode
+     capacity])
 
 (defn queue
   "Create a new queue with an optional `capacity`.
 
-  If no capacity is specified it's a synchronous queue.
-
-  Passing `:unbounded` will create an unbounded queue holding at most
-  Long/MAX_VALUE items."
+  With no capacity the queue is synchronous (rendezvous): a put blocks until a
+  matching take. A numeric `capacity` makes a bounded queue. `:unbounded`
+  allows up to `Long/MAX_VALUE` items."
   ([] (queue nil))
   ([capacity]
-   (let [lock       (ReentrantLock.)
-         sync?      (nil? capacity)
+   (let [sync?      (nil? capacity)
          unbounded? (= :unbounded capacity)
-         cap        (long (cond
-                            sync?      1
-                            unbounded? Long/MAX_VALUE
-                            :else      capacity))
-         ;; LinkedList for unbounded (no resize cost, no large array alloc);
-         ;; ArrayDeque presized for bounded (cache-friendly, no per-node alloc).
-         items      (if unbounded?
-                      (LinkedList.)
-                      (ArrayDeque. cap))]
-     (Queue. lock
-             (.newCondition lock)
-             (.newCondition lock)
-             (.newCondition lock)
-             items
-             cap
-             sync?
-             (CompletableFuture.)))))
+         cap        (long (cond sync?      0
+                                unbounded? Long/MAX_VALUE
+                                :else      capacity))
+         ch         (if sync? (a/chan) (a/chan cap))]
+     (Queue. ch (atom PersistentQueue/EMPTY) (atom false) (promise) sync? capacity))))
 
 (defn queue?
-  "Return whether the provided `obj` is a queue"
+  "Return whether the provided `obj` is a queue."
   [obj]
   (instance? Queue obj))
 
 (defn closed?
-  "Return whether the provided queue is closed"
+  "Return whether the provided queue has been closed."
   [^Queue q]
-  (.isDone ^CompletableFuture (.-closed?* q)))
+  @(.closed* q))
 
 (defn await-close
-  "Block until `q` closes"
+  "Block until `q` is closed."
   [^Queue q]
-  @(.-closed?* q))
+  (when-not @(.closed* q)
+    @(.close-promise q))
+  true)
+
+(defn- mirror-push! [^Queue q item]
+  (swap! (.items* q) #(conj % item)))
+
+(defn- mirror-pop! [^Queue q]
+  (swap! (.items* q) pop))
 
 (defn close!
-  "Close the `q`.
-
-  Subsequent puts return `false`. Pending and future takes drain remaining
-  items, then return `nil`."
+  "Close the `q`. Subsequent puts return `false`; pending and future takes
+  drain remaining items, then return `nil`. Returns `true`."
   [^Queue q]
-  (.closeQueue q))
+  (when-not @(.closed* q)
+    (reset! (.closed* q) true)
+    (a/close! (.chan q))
+    (deliver (.close-promise q) true))
+  true)
 
 (defn put!
-  "Place an `item` in the `q`, potentially blocking until space is available.
+  "Place `item` in `q`, blocking until space is available.
 
-  Returns `true` if the item is queued, or `false` if the queue is closed."
+  Returns `true` if the item was queued, or `false` if the queue is closed."
   [^Queue q item]
-  (.putValue q item))
+  (if @(.closed* q)
+    false
+    (do (mirror-push! q item)
+        (if (a/>!! (.chan q) item)
+          true
+          (do (mirror-pop! q) false)))))
 
 (defn try-put!
-  "Place an `item` in the `q`, waiting at most `timeout-ms`.
+  "Place `item` in `q`, waiting at most `timeout-ms` milliseconds.
 
-  Returns `true` if the queue accepts the `item`, `false` if it is closed
-  (or closes before the item is accepted), or `timeout-val` if the timeout
-  elapses. `timeout-val` defaults to `false`."
-  ([^Queue q item]                        (.tryPutValue q item 0 false))
-  ([^Queue q item timeout-ms]             (.tryPutValue q item timeout-ms false))
-  ([^Queue q item timeout-ms timeout-val] (.tryPutValue q item timeout-ms timeout-val)))
+  Returns `true` if accepted, `false` if the queue is closed (or closes before
+  acceptance), or `timeout-val` if the timeout elapses. `timeout-val` defaults
+  to `false`. A `timeout-ms` of `0` probes without waiting."
+  ([^Queue q item] (try-put! q item 0 false))
+  ([^Queue q item timeout-ms] (try-put! q item timeout-ms false))
+  ([^Queue q item timeout-ms timeout-val]
+   (if @(.closed* q)
+     false
+     (let [ch (.chan q)]
+       (if (pos? (long timeout-ms))
+         (do (mirror-push! q item)
+             (let [[val port] (a/alts!! [[ch item] (a/timeout (long timeout-ms))])]
+               (cond
+                 (identical? port ch) (if val true (do (mirror-pop! q) false))
+                 :else                 (do (mirror-pop! q) timeout-val))))
+         ;; timeout-ms <= 0: non-blocking probe.
+         (let [r (a/offer! ch item)]
+           (cond
+             (true? r)  (do (mirror-push! q item) true)
+             (false? r) false
+             :else      timeout-val)))))))
 
 (defn take!
-  "Take from the `q`, blocking until an item is available.
+  "Take an item from `q`, blocking until one is available.
 
   Returns `nil` if the queue is closed and drained."
   [^Queue q]
-  (.takeValue q))
+  (let [v (a/<!! (.chan q))]
+    (when (some? v) (mirror-pop! q))
+    v))
 
 (defn try-take!
-  "Try to take from the `q`, waiting at most `timeout-ms` milliseconds before
-  returning `timeout-val` (default `nil`).
-
-  Returns `nil` if the `q` is closed and drained."
-  ([^Queue q]                        (.tryTakeValue q 0 nil))
-  ([^Queue q timeout-ms]             (.tryTakeValue q timeout-ms nil))
-  ([^Queue q timeout-ms timeout-val] (.tryTakeValue q timeout-ms timeout-val)))
+  "Try to take from `q`, waiting at most `timeout-ms` before returning
+  `timeout-val` (default `nil`). Returns `nil` if `q` is closed and drained.
+  A `timeout-ms` of `0` probes without waiting."
+  ([^Queue q] (try-take! q 0 nil))
+  ([^Queue q timeout-ms] (try-take! q timeout-ms nil))
+  ([^Queue q timeout-ms timeout-val]
+   (let [ch (.chan q)]
+     (if (pos? (long timeout-ms))
+       (let [[val port] (a/alts!! [ch (a/timeout (long timeout-ms))])]
+         (cond
+           (identical? port ch) (do (when (some? val) (mirror-pop! q)) val)
+           :else                 timeout-val))
+       ;; timeout-ms <= 0: non-blocking probe.
+       (let [v (a/poll! ch)]
+         (when (some? v) (mirror-pop! q))
+         v)))))
 
 (defn items
   "Return a vector containing a point-in-time snapshot of the items currently
-  in `q`. The result is a copy; it does not update as the queue mutates.
-  Intended for inspection and debugging."
+  in `q`. Approximate under concurrency; intended for inspection and debugging."
   [^Queue q]
-  (let [lock ^ReentrantLock (.-lock q)
-        d    ^Deque         (.-items q)]
-    (.lock lock)
-    (try
-      ;; In sync mode every entry is a Parcel; in bounded/unbounded mode no
-      ;; entry is a Parcel. Branch once on the mode rather than per-item.
-      (if (.-sync? q)
-        (mapv #(.-item ^Parcel %) (.toArray d))
-        (vec (.toArray d)))
-      (finally (.unlock lock)))))
-
-;; ---- print-method ----
+  (vec @(.items* q)))
 
 (defmethod print-method Queue [^Queue q ^java.io.Writer w]
   (.write w
           (str "#queue"
-               {:capacity (if (.-sync? q) :sync (.-capacity q))
+               {:capacity (if (.sync? q) :sync (.capacity q))
                 :items    (items q)
-                :closed?  (.isDone ^CompletableFuture (.-closed?* q))})))
+                :closed?  (closed? q)})))

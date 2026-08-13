@@ -1,20 +1,28 @@
 (ns tapestry.core
-  "Core namespace of Tapestry"
-  (:import [java.util.concurrent Semaphore CompletableFuture Phaser TimeUnit TimeoutException
-            Executors]
-           [java.lang VirtualThread]
-           [java.time Duration])
-  (:require [manifold.stream :as s]
-            [manifold.deferred :as d])
+  "Core namespace of Tapestry — structured concurrency over core.async fibers.
+
+  Tapestry models a unit of concurrent work as a `fiber`: a derefable handle
+  whose body runs on its own thread. Results, errors, timeouts, and
+  cancellation all flow through that handle.
+
+  On Jolt there is no JVM thread interruption, so `interrupt!`/`timeout!`
+  deliver a cancellation to the fiber's result (a `deref` then sees it) but
+  cannot forcibly stop a body blocked on `Thread/sleep`. Cooperative bodies —
+  those that park on channel operations or check a cancellation flag — stop
+  promptly; a body pinned in a blocking call runs to completion in the
+  background while its result is reported as cancelled."
+  (:require [clojure.core.async :as a])
   (:refer-clojure :exclude [send]))
 
-(def ^{:dynamic true
-       :no-doc  true} *local-semaphore*
-  "A semaphore used to coordinate max-parallelism"
+(set! *warn-on-reflection* true)
+
+(def ^{:dynamic true :no-doc true} *local-semaphore*
+  "A core.async channel of permits used to coordinate max-parallelism, or nil."
   nil)
 
 (def ^{:dynamic true :no-doc true} *local-timeout*
-  "A timeout used to coordinate timeout delays"
+  "A timeout (number of millis or `java.time.Duration`) applied to newly
+  spawned fibers, or nil."
   nil)
 
 (def ^{:dynamic true :no-doc true} *scope*
@@ -26,10 +34,16 @@
   Set by `tapestry.experimental/with-scope`. Called with a single Fiber argument."
   nil)
 
-(def ^{:no-doc true} on-error
+(def ^{:dynamic true :no-doc true} *scope-notify!*
+  "A function called when a fiber completes, with [fiber outcome] where outcome
+  is `[:ok v]` or `[:err Throwable]`. Set by `tapestry.experimental/with-scope`.
+  Jolt promises are not watchable, so the fiber reports its own completion."
+  nil)
+
+(def ^:no-doc on-error
   "The function that will be called when an error is encountered.
 
-  Called with the  signature of: `e msg`"
+  Called with the signature of: `e msg`"
   println)
 
 (defn set-stream-error-handler!
@@ -42,192 +56,179 @@
   [f]
   (alter-var-root #'on-error (constantly f)))
 
-(set! *warn-on-reflection* true)
+;; ---------------------------------------------------------------------------
+;; Concurrency primitives (replace java.util.concurrent)
+;; ---------------------------------------------------------------------------
 
-(def ^:private -static-executor
-  (Executors/newVirtualThreadPerTaskExecutor))
+;; A counting semaphore built from a buffer-n channel prefilled with permits.
+;; `acquire` takes a permit (blocking when none remain), `release` returns one.
+(defn- ^:no-doc make-semaphore
+  [n]
+  (let [permits (a/chan n)]
+    (dotimes [_ n] (a/>!! permits :permit))
+    permits))
 
-(defn ^:no-doc -unstarted-virtual-thread
-  "Create an unstarted virtual thread. Split from `Thread/startVirtualThread` so
-  that callers can attach handlers and register the fiber before the thread runs."
-  ^Thread [^Runnable r]
-  (.unstarted ^java.lang.Thread$Builder (Thread/ofVirtual) r))
+(defn- acquire-semaphore [sem] (a/<!! sem))
+(defn- release-semaphore [sem] (a/>!! sem :permit))
 
-(deftype ^{:no-doc true} Fiber
-    [^VirtualThread virtualThread ^CompletableFuture future]
+;; The JVM's `TimeoutException`/`InterruptedException` have no constructors on
+;; Jolt's shim, so cancellation surfaces as an `ex-info` with a `:type` tag.
+;; Callers catch `clojure.lang.ExceptionInfo` and inspect `ex-data`.
+(defn- interrupted-ex []
+  (ex-info "Fiber interrupted" {:type ::interrupted}))
+(defn- timeout-ex []
+  (ex-info "Fiber timed out" {:type ::timeout}))
+
+;; A millis value from a number or a `java.time.Duration`. `java.time.Duration`
+;; is shimmed in Jolt core, so `.toMillis` works on either runtime.
+(defn- ^long ->ms [t]
+  (long
+    (cond (number? t)                          t
+          (instance? java.time.Duration t)     (.toMillis ^java.time.Duration t)
+          (nil? t)                             0
+          :else                                t)))
+
+(def ^:private ^:no-doc not-delivered
+  "Sentinel returned by a timed `deref` of a `promise` that never delivered."
+  (Object.))
+
+;; ---------------------------------------------------------------------------
+;; Fiber
+;; ---------------------------------------------------------------------------
+
+(deftype ^:no-doc Fiber
+    [result        ;; clojure.core/promise: delivered [:ok v] | [:err Throwable]
+     alive*        ;; atom: true while the body's thread is running
+     err*]         ;; atom: Throwable once the fiber has errored/been cancelled
   clojure.lang.IDeref
   (deref [_]
-    (try
-      (let [result (.get future)]
-        (.join virtualThread)
-        result)
-      (catch java.util.concurrent.ExecutionException e
-        (.join virtualThread)
-        (throw (.getCause e)))))
+    (let [[tag val] @result]
+      (when (= :err tag) (throw ^Throwable val))
+      val))
   clojure.lang.IBlockingDeref
-  (deref [_ time timeout-value]
-    (try
-      (let [result (.get future time TimeUnit/MILLISECONDS)]
-        (.join virtualThread)
-        result)
-      (catch TimeoutException _
-        timeout-value)
-      (catch java.util.concurrent.ExecutionException e
-        (.join virtualThread)
-        (throw (.getCause e)))))
+  (deref [_ ms default]
+    (let [r (deref result ms not-delivered)]
+      (if (identical? not-delivered r)
+        default
+        (let [[tag val] r]
+          (when (= :err tag) (throw ^Throwable val))
+          val))))
   clojure.lang.IPending
   (isRealized [_]
-    (.isDone future))
-  manifold.deferred.IDeferred
-  (executor [_]
-    -static-executor)
-  (realized [_]
-   (.isDone future))
-  (onRealized [_ on-success on-error]
-    (.handle ^CompletableFuture future
-             (reify java.util.function.BiFunction
-               (apply [_ res ex]
-                 (if ex
-                   (on-error ex)
-                   (on-success res))))))
-  (successValue [_ default]
-    (try
-      (.getNow future default)
-      (catch Throwable _
-        default)))
-  (errorValue [_ default]
-    (if-not (.isDone future)
-      default
-      (try
-        (.getNow future nil)
-        default
-        (catch Throwable e
-          e)))))
+    (realized? result)))
 
 (defmethod print-method Fiber [^Fiber v ^java.io.Writer w]
-  (let [^VirtualThread vt         (.virtualThread v)
-        ^CompletableFuture future (.future v)
-        is-alive?                 (.isAlive vt)
-        [val err]                 (try
-                    [(.getNow future nil) nil]
-                    (catch Exception e
-                      [nil e]))]
+  (let [done? (realized? (.result v))]
     (.write w "#tapestry/fiber {")
-    (.write w (format ":is-alive %b" is-alive?))
-    (when val
-      (.write w " :val ")
-      (print-method val w))
-    (when err
-      (.write w " :error ")
-      (print-method err w))
+    (.write w (str ":is-alive " (boolean @(.alive* v))))
+    (when done?
+      (let [[tag val] @(.result v)]
+        (when (and (= :ok tag) (some? val))
+          (.write w " :val ")
+          (print-method val w))
+        (when (= :err tag)
+          (.write w " :error ")
+          (print-method val w))))
     (.write w "}")))
 
 (defn alive?
-  "Return whether the provided `fiber` is alive"
+  "Return whether the provided `fiber` is still running."
   [^Fiber fiber]
-  (let [^VirtualThread vt (.virtualThread fiber)]
-    (.isAlive vt)))
-
-(defn fiber-error
-  "Return the error of the provided `fiber` if it has errored, otherwise return nil"
-  [^Fiber fiber]
-  (when-not (alive? fiber)
-    (try
-      (.getNow ^CompletableFuture (.future fiber) nil)
-      nil
-      (catch Exception e
-        e))))
+  @(.alive* fiber))
 
 (defn errored?
-  "Return whether the provided `fiber` has errored"
+  "Return whether the provided `fiber` has errored (or been cancelled)."
   [^Fiber fiber]
-  (.isCompletedExceptionally ^CompletableFuture (.future fiber)))
+  (some? @(.err* fiber)))
+
+(defn fiber-error
+  "Return the error of the provided `fiber` if it has errored, otherwise nil."
+  [^Fiber fiber]
+  (when-not (alive? fiber) @(.err* fiber)))
 
 (defn interrupt!
-  "Interrupt the provided fiber, causing a `java.lang.InterruptedException` to be
-  thrown in the `fiber`
+  "Cancel the provided `fiber`. A subsequent `deref` throws an
+  `InterruptedException`; callbacks registered on the fiber fire with the
+  cancellation.
 
-  Return the provided `fiber`for chaining"
+  On Jolt the cancellation is delivered to the result, but a body blocked on a
+  non-cooperative call (e.g. `Thread/sleep`) is not forcibly stopped — it runs
+  to completion in the background while its result is reported as cancelled.
+
+  Returns the provided `fiber` for chaining."
   [^Fiber fiber]
-  (let [^VirtualThread vt (.virtualThread fiber)]
-    (.interrupt vt))
+  (let [e (interrupted-ex)]
+    (swap! (.err* fiber) (fn [old] (or old e)))
+    (deliver (.result fiber) [:err e]))
   fiber)
 
 (defn timeout!
-  "Set the provided `timeout` on the provided `fiber`, causing a
-  `java.util.concurrent.TimeoutException` to be thrown on the deferred (or `default` to be returrned)
-  and the `fiber` to be interrupted.
+  "Set the provided `timeout` on the `fiber`. When it elapses the fiber is
+  cancelled (see `interrupt!`).
 
-  Return the provied `fiber` for chaining.
+  Without a `default`, a `deref` after the timeout throws
+  `java.util.concurrent.TimeoutException`. With a `default`, the `deref`
+  returns `default` instead.
 
-  Accepts either a number in millis or a duration."
+  Accepts either a number of millis or a `java.time.Duration`.
+
+  Returns the provided `fiber` for chaining."
   ([^Fiber fiber timeout]
-   (let [millis (if (pos-int? timeout) timeout (.toMillis ^Duration timeout))]
-     (.orTimeout
-       ^CompletableFuture (.future fiber)
-       millis TimeUnit/MILLISECONDS)
+   (let [ms (->ms timeout)]
+     (a/thread
+       (a/<!! (a/timeout ms))
+       (when-not (realized? (.result fiber))
+         (let [e (timeout-ex)]
+           (swap! (.err* fiber) (fn [old] (or old e)))
+           (deliver (.result fiber) [:err e]))))
      fiber))
   ([^Fiber fiber timeout default]
-   (let [millis (if (pos-int? timeout) timeout (.toMillis ^Duration timeout))]
-     (.completeOnTimeout
-       ^CompletableFuture (.future fiber)
-       default
-       millis
-       TimeUnit/MILLISECONDS)
-     ;; Wire up a completion handler to interrupt the fiber if it's still alive
-     (.whenComplete ^CompletableFuture (.future fiber)
-                    (reify java.util.function.BiConsumer
-                      (accept [_ _res _ex]
-                        (when (alive? fiber)
-                          (interrupt! fiber)))))
+   (let [ms (->ms timeout)]
+     (a/thread
+       (a/<!! (a/timeout ms))
+       (when-not (realized? (.result fiber))
+         (deliver (.result fiber) [:ok default])))
      fiber)))
 
 (defmacro fiber
-  "Execute body on a loom fiber, returning a deferred that will resolve when the fiber completes."
+  "Execute `body` on its own thread, returning a derefable `Fiber`.
+
+  Honors any active `with-max-parallelism` semaphore and `with-timeout`, and
+  registers the fiber with the current scope (`with-scope`) if one is active."
   [& body]
-  `(let [cf#     (CompletableFuture.)
-         thread# (-unstarted-virtual-thread
-                   (bound-fn []
-                     (when *local-semaphore*
-                       (.acquire ^Semaphore *local-semaphore*))
-                     (try
-                       (.complete cf# (do ~@body))
-                       (catch InterruptedException e#
-                         (when-not (and *scope* (= :on-success (:shutdown-policy *scope*)))
-                           (.completeExceptionally cf# e#)
-                           (throw e#)))
-                       (catch Throwable e#
-                         (.completeExceptionally cf# e#)
-                         (throw e#))
-                       (finally
-                         (when *local-semaphore*
-                           (.release ^Semaphore *local-semaphore*))))))
-         fiber#  (Fiber. thread# cf#)]
-     (.whenComplete cf#
-                    (reify java.util.function.BiConsumer
-                      (accept [_ _res# ex#]
-                        (when (or (instance? java.util.concurrent.CancellationException ex#)
-                                  (instance? TimeoutException ex#))
-                          (interrupt! fiber#)))))
-     (when *scope-register!*
-       (*scope-register!* fiber#))
-     (when *local-timeout*
-       (timeout! fiber# *local-timeout*))
-     (.start ^Thread thread#)
-     fiber#))
+  `(let [result# (promise)
+         alive?# (atom true)
+         err*#   (atom nil)
+         fiber*# (atom nil)]
+     (a/thread
+       (when *local-semaphore* (acquire-semaphore *local-semaphore*))
+       (let [outcome# (try
+                        [:ok (do ~@body)]
+                        (catch Throwable e#
+                          (swap! err*# (fn [old#] (or old# e#)))
+                          [:err e#])
+                        (finally
+                          (when *local-semaphore* (release-semaphore *local-semaphore*))
+                          (reset! alive?# false)))]
+         (deliver result# outcome#)
+         (when *scope-notify!* (*scope-notify!* @fiber*# outcome#))))
+     (let [fiber# (Fiber. result# alive?# err*#)]
+       (reset! fiber*# fiber#)
+       (when *scope-register!* (*scope-register!* fiber#))
+       (when *local-timeout* (timeout! fiber# *local-timeout*))
+       fiber#)))
 
 (defmacro with-max-parallelism
-  "Executes the provided body with an executor that ensures that at most `n` fibers
+  "Executes the provided body such that at most `n` fibers spawned within it
   will run in parallel."
   [n & body]
-  `(binding [*local-semaphore* (Semaphore. ~n)]
+  `(binding [*local-semaphore* (make-semaphore (int ~n))]
      ~@body))
 
 (defmacro with-timeout
   "Executes all newly spawned fibers with the provided `timeout`.
 
-  Accepts either a number (used as `millis`) or `java.lang.Duration` for
-  `timeout`."
+  Accepts either a number (used as millis) or `java.time.Duration`."
   [timeout & body]
   `(binding [*local-timeout* ~timeout]
      ~@body))
@@ -238,24 +239,24 @@
   `(fiber (loop ~bindings ~@body)))
 
 (defmacro seq->stream
-  "Macro which runs an expression that returns a (presumably lazy) sequence and runs it in a fiber,
-  returning a source stream of the results"
+  "Runs an expression that returns a (presumably lazy) sequence on a fiber and
+  returns a channel onto which the results are put. The channel is closed when
+  the sequence is exhausted."
   [expr]
-  `(let [result# (s/stream)]
-     (fiber
+  `(let [out# (a/chan)]
+     (a/thread
        (try
-         @(s/put-all! result# ~expr)
-         (finally
-           (s/close! result#))))
-     result#))
+         (run! #(a/>!! out# %) ~expr)
+         (finally (a/close! out#))))
+     out#))
 
 (defmacro pfor
-  "Macro which behaves identically to `clojure.core.for` but runs the body in parallell using
-  fibers.
+  "Behaves identically to `clojure.core.for` but runs the body in parallel
+  using fibers.
 
   Note that bindings in `:let` and `:when` will not be evaluated in parallel.
 
-  Will force evaluation of the sequence (ie. this is no longer lazy)."
+  Forces evaluation of the sequence (ie. this is no longer lazy)."
   [seq-exprs body-expr]
   `(->> (for ~seq-exprs
           (fiber
@@ -265,178 +266,183 @@
         (doall)))
 
 (defn periodically
-  "Behaves similarly to `manifold.stream/periodically` but relies on a loom
-  fiber for time keeping. If no initial delay is specified runs immediately.
+  "Return a channel that emits `(f)` every `period` millis, starting after an
+  optional `initial-delay`. The channel closes when it is consumed to
+  completion or `f` throws.
 
-  Also automatically coerces durations into millisecond values."
+  Accepts numbers (millis) or `java.time.Duration` for `period` and
+  `initial-delay`. With no initial delay, runs immediately."
   ([period f] (periodically period nil f))
   ([period initial-delay f]
-   (let [->ms       #(long (cond
-                             (number? %) %
-                             (nil? %)    0
-                             :else       (.toMillis ^Duration %)))
-         initial-ms (->ms initial-delay)
+   (let [initial-ms (->ms initial-delay)
          poll-ms    (->ms period)
-         result     (s/stream)]
-     (fiber
+         out        (a/chan)]
+     (a/thread
        (try
-         (Thread/sleep ^long initial-ms)
+         (a/<!! (a/timeout initial-ms))
          (loop []
-           (when-not (s/closed? result)
-             @(s/put! result (f))
-             (Thread/sleep ^long poll-ms)
+           (when (a/>!! out (f))
+             (a/<!! (a/timeout poll-ms))
              (recur)))
-         (catch Exception e
-           (when on-error
-             (on-error e "Error in periodically f"))
-           (s/close! result))))
-     result)))
+         (catch Exception e#
+           (when on-error (on-error e# "Error in periodically f")))
+         (finally (a/close! out))))
+     out)))
+
+;; ---------------------------------------------------------------------------
+;; asyncly — concurrent, order-independent map
+;; ---------------------------------------------------------------------------
+
+(defn- ^:no-doc asyncly-seq
+  "Unbounded parallelism over a seqable `s`; returns a seq."
+  [f s]
+  (let [result (a/chan)
+        error* (promise)
+        src    (a/to-chan s)
+        procs  (atom [])]
+    (a/thread
+      (loop []
+        (when-some [item (a/<!! src)]
+          (if (realized? error*)
+            (a/close! src)
+            (let [p (a/thread
+                      (try
+                        (when-not (realized? error*)
+                          (when-some [v (f item)]
+                            (a/>!! result v)))
+                        (catch Exception e#
+                          (when on-error (on-error e# "Exception in asyncly function"))
+                          (deliver error* e#)
+                          (a/close! src))))]
+              (swap! procs conj p)
+              (recur)))))
+      (run! a/<!! @procs)
+      (a/close! result))
+    (concat (a/<!! (a/into [] result))
+            (lazy-seq (when (realized? error*) (throw (deref error* 0 nil)))))))
+
+(defn- ^:no-doc asyncly-stream
+  "Unbounded parallelism over a channel `s`; returns a result channel."
+  [f s]
+  (let [result   (a/chan)
+        err-atom (atom nil)]
+    (a/thread
+      (let [procs (atom [])]
+        (loop []
+          (when-some [item (a/<!! s)]
+            (when-not @err-atom
+              (let [p (a/thread
+                        (try
+                          (when-not @err-atom (when-some [v (f item)] (a/>!! result v)))
+                          (catch Exception e#
+                            (when on-error (on-error e# "Exception in asyncly function"))
+                            (reset! err-atom e#)
+                            (a/close! s)
+                            (a/close! result))))]
+                (swap! procs conj p)))
+            (recur)))
+        ;; Wait for every spawned worker to finish before closing, so an
+        ;; in-flight worker's put is never dropped by an early close.
+        (run! a/<!! @procs))
+      (a/close! result))
+    result))
+
+(defn- ^:no-doc asyncly-seq-n
+  "Bounded (`n`) parallelism over a seqable `s`; returns a seq."
+  [n f s]
+  (let [result  (a/chan (a/buffer (max 1 n)))
+        error*  (promise)
+        src     (a/to-chan s)
+        work    (a/chan (max 1 n))
+        workers (atom n)]
+    (dotimes [_ n]
+      (a/thread
+        (loop []
+          (when-some [v (a/<!! work)]
+            (try
+              (when-not (realized? error*) (when-some [v (f v)] (a/>!! result v)))
+              (catch Exception e#
+                (when on-error (on-error e# "Error in asyncly callback"))
+                (deliver error* e#)
+                (a/close! work)
+                (a/close! result)))
+            (recur)))
+        (when (zero? (swap! workers dec))
+          (a/close! result))))
+    (a/thread
+      (loop []
+        (when-some [v (a/<!! src)]
+          (when-not (realized? error*)
+            (a/>!! work v)
+            (recur))))
+      (a/close! work))
+    (concat (a/<!! (a/into [] result))
+            (lazy-seq (when (realized? error*) (throw (deref error* 0 nil)))))))
+
+(defn- ^:no-doc asyncly-stream-n
+  "Bounded (`n`) parallelism over a channel `s`; returns a result channel."
+  [n f s]
+  (let [result   (a/chan)
+        err-atom (atom nil)
+        work     (a/chan (max 1 n))
+        workers  (atom n)]
+    (dotimes [_ n]
+      (a/thread
+        (loop []
+          (when-some [v (a/<!! work)]
+            (try
+              (when-not @err-atom (when-some [v (f v)] (a/>!! result v)))
+              (catch Exception e#
+                (when on-error (on-error e# "Error in asyncly callback"))
+                (reset! err-atom e#)
+                (a/close! work)
+                (a/close! s)))
+            (recur)))
+        (when (zero? (swap! workers dec))
+          (a/close! result))))
+    (a/thread
+      (loop []
+        (when-some [v (a/<!! s)]
+          (when-not @err-atom
+            (a/>!! work v)
+            (recur))))
+      (a/close! work))
+    result))
 
 (defn asyncly
-  "Executes mapping function `f` over the provided stream `s`.
+  "Applies mapping function `f` over the provided channel or seq `s`.
 
-  Returns a new stream in which items will be emitted in any order after `f` finishes.
+  Returns a channel (when `s` is a channel) or a seq (when `s` is a seqable)
+  in which items are emitted after `f` finishes, in any order.
 
-  Runs each item in a loom fiber.
-
-  Optionally takes a number `n` which will be the maximum parallelism."
+  With one arity, uses unbounded parallelism (or the max parallelism set via
+  `with-max-parallelism`). With a numeric `n`, limits to `n` concurrent calls."
   ([f s]
-   (let [result  (s/stream)
-         seq?    (seqable? s)
-         s       (if seq?
-                   (s/->source (or s '()))
-                   s)
-         phaser  (Phaser. 1)
-         error*  (when seq? (promise))]
-     (s/consume
-       (fn [item]
-         ;; Skip dispatching new fibers once an error has occurred. Unlike the n-arity
-         ;; path we cannot pre-populate a worker list, so we rely on this guard plus
-         ;; a second check inside the fiber body to prevent already-spawned fibers from
-         ;; doing work after an error. Interrupting in-flight fibers is left to the
-         ;; caller (e.g. wrapping with with-timeout or interrupting the outer fiber).
-         (when-not (and error* (realized? error*))
-           (.register phaser)
-           (fiber
-             (try
-               (when-not (and error* (realized? error*))
-                 @(s/put! result (f item)))
-               (catch Exception e
-                 (when on-error
-                   (on-error e "Exception in asyncly function"))
-                 (if seq?
-                   ;; Deliver error and close source; on-drained awaits the phaser
-                   ;; (ensuring all in-flight workers finish) before closing result.
-                   ;; This guarantees error* is realized before the sentinel runs.
-                   (do (deliver error* e)
-                       (s/close! s))
-                   (s/close! result)))
-               (finally
-                 (.arriveAndDeregister phaser))))))
-       s)
-     (s/on-drained s (bound-fn* #(fiber
-                                   (.arriveAndDeregister phaser)
-                                   (when-not (.isTerminated phaser)
-                                     (.awaitAdvance phaser 0))
-                                   (s/close! result))))
-     (s/on-closed result #(s/close! s))
-     (if seq?
-       (concat
-         (s/stream->seq result)
-         (lazy-seq
-           (when (realized? error*)
-             (throw (deref error* 0 nil)))))
-       result)))
-  ([^long n f s]
-   (let [result      (s/stream)
-         seq?        (seqable? s)
-         s           (if seq?
-                       (s/->source (or s '()))
-                       s)
-         work-buffer (s/stream n)
-         phaser      (Phaser. (inc n))
-         error*      (when seq? (promise))
-         ;; Promise of the full worker list. Delivered before the source is connected
-         ;; so no worker can receive an item (and therefore throw) until @workers* is
-         ;; already realized — avoiding a self-referential closure race.
-         workers*    (promise)
-         workers     (mapv
-                       (fn [_]
-                         (fiber
-                           (try
-                             ;; Deref workers* eagerly: it is guaranteed realized before
-                             ;; s/connect starts work, so this never blocks.  Must be
-                             ;; inside try/finally so that phaser is always deregistered
-                             ;; even if an interrupt arrives during the CountDownLatch
-                             ;; inside the promise deref.
-                             (let [siblings @workers*]
-                               (loop []
-                                 (let [val (try @(s/take! work-buffer :closed)
-                                                (catch InterruptedException _ :closed))]
-                                   (when (not= :closed val)
-                                     (when-not (and error* (realized? error*))
-                                       (try
-                                         @(s/put! result (f val))
-                                         (catch InterruptedException _
-                                           ;; Intentionally interrupted by another worker's error;
-                                           ;; swallow and exit the loop cleanly via the finally below.
-                                           nil)
-                                         (catch Exception e
-                                           (when on-error
-                                             (on-error e "Error in asyncly callback"))
-                                           (doseq [w siblings]
-                                             (interrupt! w))
-                                           ;; Interrupting siblings includes self; clear the flag
-                                           ;; so subsequent blocking calls don't throw InterruptedException.
-                                           (Thread/interrupted)
-                                           (if seq?
-                                             ;; Deliver error and close work-buffer; on-drained awaits
-                                             ;; the phaser (all in-flight workers done) before closing
-                                             ;; result, guaranteeing error* is realized for the sentinel.
-                                             (do (deliver error* e)
-                                                 (s/close! work-buffer))
-                                             (do (s/close! result)
-                                                 (s/close! work-buffer))))))
-                                     (recur)))))
-                             (finally
-                               (.arriveAndDeregister phaser)))))
-                       (range n))]
-     (deliver workers* workers)
-     (s/connect s work-buffer)
-     (s/on-drained work-buffer #(fiber (.arriveAndDeregister phaser)
-                                       (.awaitAdvance phaser 0)
-                                       (s/close! result)))
-     (if seq?
-       (concat
-         (s/stream->seq result)
-         (lazy-seq
-           (when (realized? error*)
-             (throw (deref error* 0 nil)))))
-       result))))
+   (if (seqable? s) (asyncly-seq f s) (asyncly-stream f s)))
+  ([n f s]
+   (if (seqable? s) (asyncly-seq-n n f s) (asyncly-stream-n n f s))))
 
 (defn parallelly
-  "Maps `f` over the stream or seq `s` with up to `n` items occuring in parallel.
+  "Maps `f` over the channel or seq `s` with up to `n` items occurring in
+  parallel, preserving order.
 
-  If `n` is not specified, will use unbounded parallelism (or the max parallism set via the
-  `with-max-parallelism` macro)."
+  With one arity, uses unbounded parallelism (or the max parallelism set via
+  `with-max-parallelism`). Returns a channel when `s` is a channel, else a seq."
   ([f s]
-   (let [stream? (s/stream? s)]
-     (cond->> s
-       stream? s/stream->seq
-       true    (mapv #(fiber (f %)))
-       true    (map deref)
-       stream? s/->source)))
-  ([^long n f s]
-   (let [seq? (seqable? s)]
-     (cond->> s
-       seq? (s/->source)
-       true (s/map #(d/->deferred (fiber (f %))))
-       true (s/buffer n)
-       seq? (s/stream->seq)))))
+   (let [stream? (not (seqable? s))
+         items   (if stream? (a/<!! (a/into [] s)) (seq s))
+         results (->> items (mapv #(fiber (f %))) (mapv deref))]
+     (if stream? (a/to-chan results) results)))
+  ([n f s]
+   (let [seq?    (seqable? s)
+         items   (if seq? (seq s) (a/<!! (a/into [] s)))
+         sem     (make-semaphore (max 1 n))
+         results (binding [*local-semaphore* sem]
+                   (->> items (mapv #(fiber (f %))) (mapv deref)))]
+     (if seq? results (a/to-chan results)))))
 
 (defn send
-  "A version of `send` that uses a loom fiber for the execution of the function `f`.
-
-  See `clojure.core/send` for details"
+  "Dispatch an agent action via a dedicated thread (the Jolt analog of a loom
+  virtual thread). See `clojure.core/send`."
   [a f & args]
-  (apply send-via -static-executor a f args))
+  (apply clojure.core/send a f args))
