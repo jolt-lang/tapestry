@@ -8,3 +8,4 @@ pom.xml
 target/
 .lsp/
 .clj-kondo/.cache/
+.jolt/

@@ -1,5 +1,35 @@
 # Changelog
 
+## 0.5.0
+
+Port to Jolt (Clojure on Chez Scheme) plus a round of concurrency fixes found
+by formal review.
+
+### Breaking Changes
+
+- Requires the `jolt` runtime — no JVM. The concurrency substrate is now
+  `clojure.core.async`; manifold and `java.util.concurrent` are gone.
+- Cancellation (`interrupt!`, `timeout!`) surfaces as `ex-info` with
+  `{:type :tapestry.core/interrupted}` / `{:type :tapestry.core/timeout}`
+  instead of `InterruptedException` / `TimeoutException` (not constructible on
+  Jolt).
+
+### Fixes
+
+- `tapestry.queue/try-put!` with a zero timeout mirrored the item *after*
+  offering it, so a concurrent `take!` could pop an unmirrored item —
+  `items` snapshots leaked phantom entries (an `IllegalStateException` on the
+  JVM). The mirror now happens before the offer.
+- `tapestry.experimental/alts` never returned when every operation failed, and
+  hung forever when a `:timeout` elapsed with no success. `:on-success` scopes
+  now record the first error, and `alts` awaits all fibers, returning the
+  first success or throwing the first error.
+- `interrupt!` marked an already-settled fiber as errored (`errored?` true,
+  `fiber-error` non-nil) even though its `deref` had succeeded. State is now
+  mutated only by whichever caller wins the race to deliver the result.
+- `with-max-parallelism 0` (and `with-scope :max-parallelism 0`) silently
+  deadlocked every spawned fiber. Non-positive values now throw at entry.
+
 ## 0.4.2
 
 - Chore release to add a license to `pom.xml`
