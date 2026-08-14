@@ -99,12 +99,14 @@
                (cond
                  (identical? port ch) (if val true (do (mirror-pop! q) false))
                  :else                 (do (mirror-pop! q) timeout-val))))
-         ;; timeout-ms <= 0: non-blocking probe.
-         (let [r (a/offer! ch item)]
-           (cond
-             (true? r)  (do (mirror-push! q item) true)
-             (false? r) false
-             :else      timeout-val)))))))
+          ;; timeout-ms <= 0: non-blocking probe. Mirror the item before the
+          ;; offer so a concurrent take can never pop an unmirrored item.
+          (do (mirror-push! q item)
+              (let [r (a/offer! ch item)]
+                (cond
+                  (true? r)  true
+                  (false? r) (do (mirror-pop! q) false)
+                  :else      (do (mirror-pop! q) timeout-val)))))))))
 
 (defn take!
   "Take an item from `q`, blocking until one is available.

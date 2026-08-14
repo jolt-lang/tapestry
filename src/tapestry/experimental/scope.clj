@@ -58,9 +58,12 @@
         (interrupt-siblings scope fiber))
 
       :on-success
-      (when (= :ok tag)
-        (deliver-first (:first-result scope) val)
-        (interrupt-siblings scope fiber))
+      (if (= :ok tag)
+        (do (deliver-first (:first-result scope) val)
+            (interrupt-siblings scope fiber))
+        ;; Record the failure so callers like `alts` can surface it when no
+        ;; operation succeeds; siblings keep running (one may still succeed).
+        (deliver-first (:first-error scope) val))
 
       nil)))
 
@@ -117,10 +120,13 @@
          register#  (fn [fiber#] (register-fiber! scope# fiber#))
          notify#    (fn [fiber# outcome#] (notify-fiber! scope# fiber# outcome#))
          sem#       (when max-par#
-                      (let [n# (int max-par#)
-                            c# (a/chan n#)]
-                        (dotimes [_# n#] (a/>!! c# :permit))
-                        c#))]
+                       (let [n# (int max-par#)]
+                         (when-not (pos? n#)
+                           (throw (ex-info "max-parallelism must be a positive integer"
+                                           {:max-parallelism n#})))
+                         (let [c# (a/chan n#)]
+                           (dotimes [_# n#] (a/>!! c# :permit))
+                           c#)))]
      (binding [tc/*scope*           scope#
                tc/*scope-register!* register#
                tc/*scope-notify!*   notify#

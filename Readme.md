@@ -1,77 +1,62 @@
 # Tapestry
 
-[![Build Status](https://github.com/teknql/tapestry/actions/workflows/ci.yml/badge.svg)](https://github.com/teknql/tapestry/actions)
-[![Clojars Project](https://img.shields.io/clojars/v/teknql/tapestry.svg?include_prereleases)](https://clojars.org/teknql/tapestry)
-[![cljdoc badge](https://cljdoc.org/badge/teknql/tapestry)](https://cljdoc.org/d/teknql/tapestry)
+[![Build Status](https://github.com/jolt-lang/tapestry/actions/workflows/ci.yml/badge.svg)](https://github.com/jolt-lang/tapestry/actions)
 
-Next generation concurrency primitives for Clojure built on top of Project Loom
-
+Structured concurrency primitives for Clojure running on
+[Jolt](https://github.com/jolt-lang/jolt) (Clojure on Chez Scheme — no JVM).
 
 ## About
 
-[Project Loom](https://wiki.openjdk.java.net/display/loom/Main) is bringing first-class fibers
-to the JVM! Tapestry seeks to bring ergonomic clojure APIs for working with Loom.
+Tapestry models a unit of concurrent work as a `fiber`: a derefable handle whose
+body runs on its own thread. Results, errors, timeouts, and cancellation all
+flow through that handle. The concurrency substrate is
+`clojure.core.async`.
 
-### What are Fibers and Why do I care?
+On Jolt there is no JVM thread interruption, so `interrupt!`/`timeout!` deliver
+a cancellation to the fiber's result (a `deref` then sees it) but cannot
+forcibly stop a body blocked on `Thread/sleep`. Cooperative bodies — those that
+park on channel operations or check a cancellation flag — stop promptly; a body
+pinned in a blocking call runs to completion in the background while its result
+is reported as cancelled.
 
-Fibers behave similarly to OS level threads, but are much lighter weight to spawn, allowing
-potentially millions of them to exist.
-
-Clojure already has the wonderful [core.async](https://github.com/clojure/core.async)
-and [manifold](https://github.com/clj-commons/manifold) libraries but writing maximally performant code
-in either requires the abstraction (channels, or promises) to leak all over your code
-(as you return channels or promise chains) to avoid blocking. Furthermore you frequently have to
-think about which executor will handle the blocking code.
-
-Loom moves handling parking to the JVM runtime level making it possible for "blocking" code to be
-executed in a highly parallel fashion without the developer having to explicitly opt into the
-behavior. This is similar to how Golang and Haskell achieve their highly performant parallelism.
-
-Some great further reading on the topic:
-
-  - [What color is your function](https://journal.stuffwithstuff.com/2015/02/01/what-color-is-your-function/) - A mental exploration of
-  the leaking of the abstraction.
-  - [Async Rust Book Async Intro](https://rust-lang.github.io/async-book/01_getting_started/02_why_async.html) - A
-  good explanation of why we want async. The rest of this book is fantastic in terms of
-  understanding how async execution works under the hood. In `manifold` and `core.async`
-  the JVM executor is mostly analogous to the rust's concept of the Executor. In a language like
-  Rust, without a runtime, being explicit and "colorizing functions" makes sense, but with a
-  run-time we can do better.
-  - [Project Loom Wiki](https://wiki.openjdk.java.net/display/loom/Main#Main-Continuations) - Internal design notes of Loom.
+Cancellation surfaces as `clojure.lang.ExceptionInfo` carrying `{:type
+:tapestry.core/interrupted}` or `{:type :tapestry.core/timeout}`.
 
 ### Project State
 
-Tapestry is still pre-1.0. As the APIs in loom have stabilized so too has tapestry.
-
-Tapestry is being used in production for several of Teknql's projects and has
-more or less replaced both `clojure.core/future` and `manifold.deferred/future`.
-
-It is the ambition of the project to eventually drop manifold entirely, at which
-point it will likely hit 1.0.
+Tapestry is pre-1.0. This fork runs on Jolt and replaces the former
+manifold/`java.util.concurrent` substrate with `core.async`.
 
 ## Installation
 
-Add to your deps.edn:
+Requires the [jolt](https://jolt-lang.github.io/) binary. Add to your
+deps.edn:
 
 ```
-teknql/tapestry {:git/url "https://github.com/teknql/tapestry"
-                 :git/sha "d4c09e1866ab9d4988f04fca83969043b4c857f8"}
+jolt-lang/tapestry {:git/url "https://github.com/jolt-lang/tapestry"
+                    :git/sha "..."}
 ```
 
-## Showcase
+## Usage
 
-Here is a demo of some of the basics.
-
-#### Spawning a Fiber
-
+#### Creating Fibers
 ```clojure
-(require '[tapestry.core :refer [fiber fiber-loop]])
+(require '[tapestry.core :refer [fiber]])
 
-;; Spawning a Fiber behaves very similarly to `future` in standard clojure, but
-;; runs in a Loom Fiber and returns a tapestry.core.Fiber which implements IDeref.
-@(fiber (+ 1 2 3 4))
-;; => 10
+;; Fibers are derefable like futures
+@(fiber (Thread/sleep 1000) :done)
+;; => :done, after 1s
 
+;; Or multiple derefs, deref is non-blocking once realized
+(let [f (fiber (+ 1 2 3 4))]
+  @f ;; => 10
+  @f ;; => 10
+  )
+
+;; Deref's with timeouts are supported
+(let [f (fiber (Thread/sleep 10000))]
+  (deref f 100 :timed-out))
+;; => :timed-out, after 100ms
 
 ;; Or, Like `core.async`'s `go-loop'
 
@@ -85,151 +70,127 @@ Here is a demo of some of the basics.
 
 #### Interrupting and introspecting a Fiber
 ```clojure
-(require '[tapestry.core :refer [fiber interrupt! alive?]]')
+(require '[tapestry.core :refer [fiber interrupt! alive? errored?]])
 
 (let [f (fiber (Thread/sleep 10000))]
   (alive? f) ;; true
   (interrupt! f)
-  (alive? f) ;; false
-  @f ;; Raises java.lang.InterruptedException))
+  (alive? f) ;; true until the body's thread finishes, but
+  (errored? f) ;; true — the fiber's result was cancelled
+  @f ;; throws ExceptionInfo {:type :tapestry.core/interrupted}
+  )
 ```
 
 #### Timeouts
 
 Tapestry supports setting timeouts on fibers which will cause them to be
-interrupted (with a `java.lang.InterruptedException`) when the timeout is hit.
+cancelled when the timeout is hit.
 
 ```clojure
-(require '[tapestry.core :refer [fiber timeout! alive?]]')
+(require '[tapestry.core :refer [fiber timeout!]])
 
 (let [f (fiber (Thread/sleep 10000))]
   (timeout! f 100)
-  (alive? f) ;; true
-  (Thread/sleep 200)
-  (alive? f) ;; false
-  @f ;; Raises java.util.concurrent.TimeoutException))
+  @f) ;; throws ExceptionInfo {:type :tapestry.core/timeout} after 100ms
 ```
 
 You can also specify a default value
 
 ```clojure
-(require '[tapestry.core :refer [fiber timeout! alive?]]')
+(require '[tapestry.core :refer [fiber timeout!]])
 
 (let [f (fiber (Thread/sleep 10000))]
   (timeout! f 100 :default)
-  @f ;; => :default))
+  @f) ;; => :default
 ```
-
 
 You can use dynamic bindings to set a timeout on a bunch of fibers. Note that
 each fiber will have a timeout that starts from when the fiber was spawned.
 
 ```clojure
-(require '[tapestry.core :refer [fiber alive? with-timeout]]')
+(require '[tapestry.core :refer [fiber with-timeout]])
 
 (with-timeout 100 ;; Accepts a duration or number of millis
   (let [f (fiber (Thread/sleep 10000))]
-    @f ;; raises java.util.concurrent.TimeoutException
-    ))
+    @f)) ;; throws ExceptionInfo {:type :tapestry.core/timeout}
 ```
 
 #### Processing Sequences
 ```clojure
-(require '[tapestry.core :refer [parallelly asyncly pfor]]
-         '[clj-http.client :as clj-http])
+(require '[tapestry.core :refer [parallelly asyncly pfor]])
 
 (def urls
   ["https://google.com"
-   "https://bing.com"
-   "https://yahoo.com"])
+   "https://teknql.tech/"])
 
-;; We can also run a function over a sequence, spawning a fiber for each item.
-(->> urls
-     (parallelly clj-http/get))
+;; Realize a seq in parallel, in whatever order the results come back
+(asyncly #(slurp %) urls)
 
-;; We can using the built in `pfor` macro to evaluate a `for` expression in parallel. Note that unlike
-;; clojure.core/for, this is not lazy.
+;; Same, but preserving order
+(parallelly #(slurp %) urls)
+
+;; `for` comprehension on steroids
 (pfor [url urls]
-  (clj-http/get url))
-
-;; Similalry, if we don't care about the order of items being maintained, and instead just want
-;; to return results as quickly as possible
-
-(doseq [resp (asyncly clj-http/get urls)]
-  (println "Got Response!" (:status resp)))
+  (slurp url))
 ```
 
-#### Bounded Parallelism
+#### Concurrency limiting
 
 ```clojure
-;; We can control max parallelism for fibers
-(require '[tapestry.core :refer [parallelly fiber]])
+(require '[tapestry.core :refer [fiber with-max-parallelism]])
 
-;; Note that you can also use `with-max-parallelism` within a fiber body
-;; which will limit parallelism of all newly spawned fibers. Consider the following
-;; in which we process up to 3 orders simultaneously, and each order can process up to 2
-;; tasks in parallel.
-(defn process-order!
-  [order]
-  (with-max-parallelism 2
-    (let [internal-notification-success? (fiber (send-internal-notification! order))
-          shipping-success?     (fiber (ship-order! order))
-          receipt-success?      (fiber (send-receipt! order))]
-      {:is-notified @internal-notification-success?
-       :is-shipped  @shipping-success?
-       :has-receipt @receipt-success?})))
+;; Fibers spawned within `with-max-parallelism` are gated on a shared
+;; semaphore; at most 3 bodies run at a time.
 (with-max-parallelism 3
-  (let [order-a-summary (process-order! order-a)
-        order-b-summary (process-order! order-b)
-        order-c-summary (process-order! order-c)
-        order-d-summary (process-order! order-d)]
+  (let [order-a-summary (fiber (process-order! order-a))
+        order-b-summary (fiber (process-order! order-b))
+        order-c-summary (fiber (process-order! order-c))
+        order-d-summary (fiber (process-order! order-d))]
     {:a @order-a-summary
      :b @order-b-summary
      :c @order-c-summary
-     :d @order-d-summary})
+     :d @order-d-summary}))
 
+;; You can also bound the parallelism of sequence processing functions by
+;; specifying an optional bound:
 
-;; You can also bound the parallelism of sequence processing functions by specifying
-;; an optional bound:
+(asyncly 3 slurp urls)
 
-(asyncly 3 clj-http/get urls)
-
-(parallelly 3 clj-http/get urls)
+(parallelly 3 slurp urls)
 ```
 
+#### Streams (channels)
 
-#### Manifold Support
+`asyncly` and `parallelly` also accept `core.async` channels, allowing you to
+describe parallel execution pipelines. `periodically` returns a channel that
+emits `(f)` every `period`; close it to stop.
 
 ```clojure
-(require '[manifold.stream :as s]
-         '[tick.alpha.api :as t]
-         '[tapestry.core :refer [periodically parallelly asyncly]])
+(require '[clojure.core.async :as a]
+         '[tapestry.core :as tapestry])
 
-;; tapestry.core/periodically behaves very similar to manifold's built in periodically,
-;; but runs each task in a fiber. You can terminate it by closing the stream.
 (let [count     (atom 0)
-      generator (periodically (t/new-duration 1 :seconds) #(swap! count inc))]
-    (->> generator
-         (s/consume #(println "Count is now:" %)))
-    (Thread/sleep 5000)
-    (s/close! generator))
+      generator (tapestry/periodically 1000 #(swap! count inc))]
+  (a/go-loop []
+    (when-some [v (a/<! generator)]
+      (println "Count is now:" v)
+      (recur)))
+  (Thread/sleep 5000)
+  (a/close! generator))
 
-;; Also, `parallelly` and `asyncly` both support manifold streams, allowing you to describe parallel
-;; execution pipelines
-(->> (s/stream)
-     (parallelly 5 some-operation)
-     (asyncly 5 some-other-operation)
-     (s/consume #(println "Got Result" %)))
+(a/<!!
+ (a/into []
+   (tapestry/asyncly 5 some-operation (a/to-chan [1 2 3]))))
 ```
 
 #### Working with Agents
 
-``` clojure
+```clojure
 (let [counter (agent 0)]
   (tapestry.core/send counter inc)
   (await counter)
-  @a)
-  ;; => 1
+  @counter)
+;; => 1
 ```
 
 ## Experimental Features
@@ -244,10 +205,10 @@ management, shutdown policies, timeouts, and parallelism control into a single
 construct.
 
 Any fibers spawned with `tapestry.core/fiber` inside a scope are automatically
-registered. On scope exit, all fibers are awaited (full thread termination, not
-just future completion), and shutdown policies are enforced.
+registered. On scope exit, all fibers are awaited, and shutdown policies are
+enforced.
 
-``` clojure
+```clojure
 (require '[tapestry.experimental.scope :refer [with-scope]]
          '[tapestry.core :refer [fiber]])
 
@@ -261,7 +222,7 @@ just future completion), and shutdown policies are enforced.
 ;; and the error propagates from the scope
 (with-scope {:shutdown :on-failure}
   (let [user   (fiber (fetch-user id))
-        orders (fiber (fetch-orders id))]
+         orders (fiber (fetch-orders id))]
     {:user @user :orders @orders}))
 
 ;; Combined options
@@ -275,7 +236,7 @@ just future completion), and shutdown policies are enforced.
 
 Scopes nest naturally — inner scope fibers are tracked by the inner scope only:
 
-``` clojure
+```clojure
 (with-scope {:shutdown :on-failure}
   (let [a (fiber
             (with-scope {:shutdown :on-failure}
@@ -288,11 +249,12 @@ Scopes nest naturally — inner scope fibers are tracked by the inner scope only
 
 #### alts
 
-``` clojure
+```clojure
 (require '[tapestry.experimental :refer [alts]])
 
 ;; Runs all expressions in parallel, returning the first successful
-;; result. Remaining fibers are interrupted.
+;; result. Remaining fibers are interrupted. If every operation fails,
+;; the first error is thrown.
 (alts
   (do (Thread/sleep 100)
       :first)
@@ -300,7 +262,7 @@ Scopes nest naturally — inner scope fibers are tracked by the inner scope only
       :second))
 ;; => :second after 10ms
 
-;; With options
+;; With options — throws the timeout error if nothing succeeds in time
 (alts {:timeout 3000}
   (fetch-from-primary)
   (fetch-from-replica))
@@ -308,12 +270,13 @@ Scopes nest naturally — inner scope fibers are tracked by the inner scope only
 
 #### Queues
 
-The beginnings of potentially dropping manifold support. Lightweight wrapper around java's
-BlockingQueues with the notion of `closing` ala `manifold` and `core.async`.
+Blocking queues over `clojure.core.async` with the notion of `closing` ala
+`manifold` and `core.async`. Synchronous (rendezvous) by default; pass a
+capacity for a bounded queue or `:unbounded`.
 
-``` clojure
+```clojure
 (require '[tapestry.queue :as q]
-         '[tapestry.core :refer [fiber alive?]]')
+         '[tapestry.core :refer [fiber alive?]])
 
 ;; By default a queue has no buffer
 (let [q     (q/queue)
@@ -325,12 +288,27 @@ BlockingQueues with the notion of `closing` ala `manifold` and `core.async`.
   (q/close! q) ;; Closing a queue will make it so no further items are accepted,
                ;; but previously queued items will be delivered via `take!`
   (q/put! q :value) ;; Returns false
-)
+  )
+
+;; Bounded queue of capacity 2
+(let [q (q/queue 2)]
+  (q/put! q :a)
+  (q/put! q :b)
+  (q/try-put! q :c 0) ;; => false, full
+  (q/take! q)) ;; => :a
+
+;; Snapshot of the current contents (approximate under concurrency)
+(q/items q)
 ```
 
 ## Advisories
 
-None at the moment
+- `interrupt!` and `timeout!` are cooperative on Jolt: a body blocked in a
+  non-cooperative call (e.g. `Thread/sleep`) keeps running in the background
+  while its result reports cancelled. Park on channel operations or check
+  `errored?` in loops for prompt cancellation.
+- `with-max-parallelism` and `with-scope :max-parallelism` require a positive
+  integer; other values throw at scope entry.
 
 ## CLJ Kondo Config
 
@@ -343,11 +321,8 @@ Add the following to your `.clj-kondo/config.edn`
 
 ## Long Term Wish List
 
-- [ ] Consider whether we can drop manifold. What do streams look like?
-- [x] Implement structured concurrency using either java built-in APIs
-      (currently gated) or see if clojure affords us a nicer API.
+- [x] Drop manifold — the substrate is now `core.async`.
+- [x] Implement structured concurrency (`tapestry.experimental.scope`).
 - [ ] Consider implement linking ala erlang
 - [ ] Consider implementing an OTP-like interface
-- [ ] Consider cljs support
 - [ ] `(parallelize ...)` macro to automatically re-write call graphs
-

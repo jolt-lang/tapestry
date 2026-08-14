@@ -125,4 +125,29 @@
     (is (= :result
            (sut/alts {:timeout 5000}
              :result
-             (Thread/sleep 30000))))))
+             (Thread/sleep 30000)))))
+
+  (testing "throws the first error rather than hanging when all operations fail"
+    (tc/set-stream-error-handler! (fn [& _]))
+    (try
+      (let [f (tc/fiber (sut/alts (throw (ex-info "boom" {}))
+                                  (throw (ex-info "boom2" {}))))]
+        (is (thrown-with-msg? clojure.lang.ExceptionInfo #"boom"
+                              (deref f 2000 :hung))))
+      (finally
+        (tc/set-stream-error-handler! println))))
+
+  (testing "timeout expiring with no success throws instead of hanging"
+    (let [f (tc/fiber (sut/alts {:timeout 50}
+                                (do (Thread/sleep 30000) :slow1)
+                                (do (Thread/sleep 30000) :slow2)))]
+      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"timed out"
+                            (deref f 2000 :hung))))))
+
+(deftest with-scope-invalid-max-parallelism-test
+  (testing "with-scope :max-parallelism 0 is rejected instead of deadlocking"
+    (let [f (tc/fiber (sut/with-scope {:max-parallelism 0}
+                       (tc/fiber 1)
+                       :ok))]
+      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"max-parallelism"
+                            (deref f 2000 :hung))))))

@@ -12,7 +12,9 @@
 
 (defmacro alts
   "Execute the given `exprs` in parallel and return the result of the first one to
-  succeed, interrupting all others.
+  succeed, interrupting all others. If every operation fails, throws the first
+  error; if a `:timeout` is given and nothing succeeds before it elapses,
+  throws the timeout error.
 
   Example:
     (alts
@@ -32,4 +34,8 @@
        (scope/with-scope scope-opts#
          ~@(map (fn [expr] `(tc/fiber ~expr)) exprs)
          (let [scope# tc/*scope*]
-           @(:first-result scope#))))))
+           (scope/await-all! scope#)
+           (cond
+             (realized? (:first-result scope#)) @(:first-result scope#)
+             (realized? (:first-error scope#))  (throw @(:first-error scope#))
+             :else                              nil))))))

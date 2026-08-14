@@ -64,6 +64,9 @@
 ;; `acquire` takes a permit (blocking when none remain), `release` returns one.
 (defn- ^:no-doc make-semaphore
   [n]
+  (when-not (pos? n)
+    (throw (ex-info "max-parallelism must be a positive integer"
+                    {:max-parallelism n})))
   (let [permits (a/chan n)]
     (dotimes [_ n] (a/>!! permits :permit))
     permits))
@@ -158,8 +161,12 @@
   Returns the provided `fiber` for chaining."
   [^Fiber fiber]
   (let [e (interrupted-ex)]
-    (swap! (.err* fiber) (fn [old] (or old e)))
-    (deliver (.result fiber) [:err e]))
+    ;; Only mutate state when this interrupt wins the race to settle the
+    ;; result; a fiber that already settled (success or another error) must
+    ;; not be re-marked as errored.
+    (when (deliver (.result fiber) [:err e])
+      (swap! (.err* fiber) (fn [old] (or old e)))
+      (when *scope-notify!* (*scope-notify!* fiber [:err e]))))
   fiber)
 
 (defn timeout!
@@ -177,17 +184,17 @@
    (let [ms (->ms timeout)]
      (a/thread
        (a/<!! (a/timeout ms))
-       (when-not (realized? (.result fiber))
-         (let [e (timeout-ex)]
+       (let [e (timeout-ex)]
+         (when (deliver (.result fiber) [:err e])
            (swap! (.err* fiber) (fn [old] (or old e)))
-           (deliver (.result fiber) [:err e]))))
+           (when *scope-notify!* (*scope-notify!* fiber [:err e])))))
      fiber))
   ([^Fiber fiber timeout default]
    (let [ms (->ms timeout)]
      (a/thread
        (a/<!! (a/timeout ms))
-       (when-not (realized? (.result fiber))
-         (deliver (.result fiber) [:ok default])))
+       (when (deliver (.result fiber) [:ok default])
+         (when *scope-notify!* (*scope-notify!* fiber [:ok default]))))
      fiber)))
 
 (defmacro fiber
@@ -207,11 +214,11 @@
                         (catch Throwable e#
                           (swap! err*# (fn [old#] (or old# e#)))
                           [:err e#])
-                        (finally
-                          (when *local-semaphore* (release-semaphore *local-semaphore*))
-                          (reset! alive?# false)))]
-         (deliver result# outcome#)
-         (when *scope-notify!* (*scope-notify!* @fiber*# outcome#))))
+                         (finally
+                           (when *local-semaphore* (release-semaphore *local-semaphore*))
+                           (reset! alive?# false)))]
+          (when (deliver result# outcome#)
+            (when *scope-notify!* (*scope-notify!* @fiber*# outcome#)))))
      (let [fiber# (Fiber. result# alive?# err*#)]
        (reset! fiber*# fiber#)
        (when *scope-register!* (*scope-register!* fiber#))
@@ -239,9 +246,9 @@
   `(fiber (loop ~bindings ~@body)))
 
 (defmacro seq->stream
-  "Runs an expression that returns a (presumably lazy) sequence on a fiber and
-  returns a channel onto which the results are put. The channel is closed when
-  the sequence is exhausted."
+  "Runs an expression that returns a (presumably lazy) sequence on a dedicated
+  thread and returns a channel onto which the results are put. The channel is
+  closed when the sequence is exhausted."
   [expr]
   `(let [out# (a/chan)]
      (a/thread

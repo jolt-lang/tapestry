@@ -378,3 +378,20 @@
       (sut/send a + 1 2 3 4)
       (await a)
       (is (= 10 @a)))))
+
+(deftest fiber-interrupt-after-settle-test
+  (testing "interrupting a fiber that already settled does not mark it errored"
+    (let [f (sut/fiber :done)]
+      (is (= :done @f))
+      (Thread/sleep 20)
+      (is (false? (sut/alive? f)))
+      (sut/interrupt! f)
+      (is (false? (sut/errored? f)) "a settled fiber must not report errored?")
+      (is (nil? (sut/fiber-error f)))
+      (is (= :done @f)))))
+
+(deftest with-max-parallelism-invalid-test
+  (testing "with-max-parallelism 0 is rejected instead of deadlocking"
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"max-parallelism"
+          (sut/with-max-parallelism 0
+            (sut/fiber :x))))))

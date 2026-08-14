@@ -112,3 +112,17 @@
         (when-not (= [:a] @out)
           (throw (ex-info "Property violation" {:out @out})))))
     (is true)))
+
+(deftest queue--try-put-zero-mirror-race-test
+  (testing "try-put! with timeout 0 mirrors the item before offering it"
+    (dotimes [_ 3000]
+      (let [q (sut/queue 8)
+            p (fiber (sut/try-put! q :x 0))
+            t (fiber (sut/take! q))]
+        (let [pv        (try @p (catch Throwable e [:put-err e]))
+              tv        (try @t (catch Throwable e [:take-err e]))
+              remaining (sut/items q)]
+          (when (or (not= pv true) (not= tv :x) (not= [] remaining))
+            (throw (ex-info "Property violation"
+                            {:put pv :take tv :items remaining}))))))
+    (is true)))

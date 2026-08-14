@@ -1,25 +1,31 @@
 name: CI
 
-# Controls when the action will run. Triggers the workflow on push or pull request
-# events but only for the master branch
 on:
   push:
-    branches: [ master ]
+    branches: [master]
   pull_request:
-    branches: [ master ]
 
-# A workflow run is made up of one or more jobs that can run sequentially or in parallel
 jobs:
-  test:
-    # The type of runner that the job will run on
-    runs-on: ubuntu-latest
-
-    # Steps represent a sequence of tasks that will be executed as part of the job
+  test-macos:
+    runs-on: macos-latest
     steps:
-      # Checks-out your repository under $GITHUB_WORKSPACE, so your job can access it
-      - uses: actions/checkout@v2
-      - name: Run Tests
-        uses: docker://clojure:temurin-25-tools-deps
-        with:
-          entrypoint: /usr/local/bin/clojure
-          args: -M:test
+      - uses: actions/checkout@v4
+      - name: Install jolt
+        run: brew install jolt-lang/jolt/jolt
+      - name: Run tests
+        run: jolt -M:test
+
+  test-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install jolt
+        run: |
+          curl -sSL -o jolt.tar.gz \
+            https://github.com/jolt-lang/jolt/releases/download/v0.7.11/jolt-v0.7.11-x86_64-linux.tar.gz
+          mkdir -p "$HOME/.local/bin" /tmp/jolt-extract
+          tar -xzf jolt.tar.gz -C /tmp/jolt-extract
+          find /tmp/jolt-extract -name jolt -type f -exec install -m 755 {} "$HOME/.local/bin/jolt" \;
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      - name: Run tests
+        run: jolt -M:test
