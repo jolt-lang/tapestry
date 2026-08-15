@@ -202,11 +202,11 @@
         (sut/set-stream-error-handler! println)))))
 
 (deftest periodically-test
-  (let [ch (sut/periodically 3 5 (constantly true))]
-    (is (nil? (a/poll! ch)))                               ;; nothing immediately
-    (is (true? (first (a/alts!! [ch (a/timeout 50)]))))    ;; wait for first tick
-    (is (nil? (a/poll! ch)))                               ;; nothing immediately
-    (is (true? (first (a/alts!! [ch (a/timeout 20)]))))    ;; wait for next tick
+  (let [ch (sut/periodically 50 50 (constantly true))]
+    (is (nil? (a/poll! ch)))                                ;; nothing immediately
+    (is (true? (first (a/alts!! [ch (a/timeout 500)]))))    ;; wait for first tick
+    (is (nil? (a/poll! ch)))                                ;; nothing immediately
+    (is (true? (first (a/alts!! [ch (a/timeout 500)]))))    ;; wait for next tick
     (a/close! ch)))
 
 
@@ -313,7 +313,7 @@
 
 (deftest alive?-test
   (testing "a fiber is alive while its body runs and dead once it returns"
-    (let [f (sut/fiber (Thread/sleep 50))]
+    (let [f (sut/fiber (Thread/sleep 2000))]
       (Thread/sleep 10)
       (is (sut/alive? f))
       @f

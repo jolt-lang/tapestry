@@ -102,7 +102,8 @@
 (deftype ^:no-doc Fiber
     [result        ;; clojure.core/promise: delivered [:ok v] | [:err Throwable]
      alive*        ;; atom: true while the body's thread is running
-     err*]         ;; atom: Throwable once the fiber has errored/been cancelled
+     err*          ;; atom: Throwable once the fiber has errored/been cancelled
+     settled*]     ;; atom: false until exactly one settlement claims the fiber
   clojure.lang.IDeref
   (deref [_]
     (let [[tag val] @result]
@@ -134,6 +135,18 @@
           (print-method val w))))
     (.write w "}")))
 
+(defn ^:no-doc settle!
+  "Settle `fiber` with `outcome` exactly once. The winner of the CAS runs
+  fiber state updates and scope bookkeeping BEFORE delivering the result
+  promise, so waiters (deref, scope await-all!) never observe a settled
+  result whose scope state (first-error/first-result) is not yet recorded."
+  [^Fiber fiber [tag val :as outcome]]
+  (when (compare-and-set! (.settled* fiber) false true)
+    (when (= :err tag)
+      (swap! (.err* fiber) (fn [old] (or old val))))
+    (when *scope-notify!* (*scope-notify!* fiber outcome))
+    (deliver (.result fiber) outcome)))
+
 (defn alive?
   "Return whether the provided `fiber` is still running."
   [^Fiber fiber]
@@ -160,13 +173,7 @@
 
   Returns the provided `fiber` for chaining."
   [^Fiber fiber]
-  (let [e (interrupted-ex)]
-    ;; Only mutate state when this interrupt wins the race to settle the
-    ;; result; a fiber that already settled (success or another error) must
-    ;; not be re-marked as errored.
-    (when (deliver (.result fiber) [:err e])
-      (swap! (.err* fiber) (fn [old] (or old e)))
-      (when *scope-notify!* (*scope-notify!* fiber [:err e]))))
+  (settle! fiber [:err (interrupted-ex)])
   fiber)
 
 (defn timeout!
@@ -182,19 +189,15 @@
   Returns the provided `fiber` for chaining."
   ([^Fiber fiber timeout]
    (let [ms (->ms timeout)]
-     (a/thread
-       (a/<!! (a/timeout ms))
-       (let [e (timeout-ex)]
-         (when (deliver (.result fiber) [:err e])
-           (swap! (.err* fiber) (fn [old] (or old e)))
-           (when *scope-notify!* (*scope-notify!* fiber [:err e])))))
-     fiber))
+      (a/thread
+        (a/<!! (a/timeout ms))
+        (settle! fiber [:err (timeout-ex)]))
+      fiber))
   ([^Fiber fiber timeout default]
    (let [ms (->ms timeout)]
      (a/thread
        (a/<!! (a/timeout ms))
-       (when (deliver (.result fiber) [:ok default])
-         (when *scope-notify!* (*scope-notify!* fiber [:ok default]))))
+       (settle! fiber [:ok default]))
      fiber)))
 
 (defmacro fiber
@@ -206,7 +209,8 @@
   `(let [result# (promise)
          alive?# (atom true)
          err*#   (atom nil)
-         fiber*# (atom nil)]
+         settled*# (atom false)
+         fiber*# (promise)]
      (a/thread
        (when *local-semaphore* (acquire-semaphore *local-semaphore*))
        (let [outcome# (try
@@ -217,10 +221,9 @@
                          (finally
                            (when *local-semaphore* (release-semaphore *local-semaphore*))
                            (reset! alive?# false)))]
-          (when (deliver result# outcome#)
-            (when *scope-notify!* (*scope-notify!* @fiber*# outcome#)))))
-     (let [fiber# (Fiber. result# alive?# err*#)]
-       (reset! fiber*# fiber#)
+         (settle! @fiber*# outcome#)))
+     (let [fiber# (Fiber. result# alive?# err*# settled*#)]
+       (deliver fiber*# fiber#)
        (when *scope-register!* (*scope-register!* fiber#))
        (when *local-timeout* (timeout! fiber# *local-timeout*))
        fiber#)))

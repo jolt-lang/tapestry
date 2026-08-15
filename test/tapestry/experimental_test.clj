@@ -142,7 +142,32 @@
                                 (do (Thread/sleep 30000) :slow1)
                                 (do (Thread/sleep 30000) :slow2)))]
       (is (thrown-with-msg? clojure.lang.ExceptionInfo #"timed out"
-                            (deref f 2000 :hung))))))
+                            (deref f 2000 :hung)))))
+
+(deftest alts-settlement-race-stress-test
+  ;; Regression: scope bookkeeping (first-error/first-result) used to run
+  ;; AFTER the result delivery that wakes await-all!, so alts could observe
+  ;; neither promise realized and return nil instead of throwing.
+  (testing "timeout outcome is reported on every iteration, never nil"
+    (tc/set-stream-error-handler! (fn [& _]))
+    (try
+      (dotimes [_ 150]
+        (let [f (tc/fiber (sut/alts {:timeout 20}
+                                    (do (Thread/sleep 5000) :slow1)
+                                    (do (Thread/sleep 5000) :slow2)))]
+          (is (thrown-with-msg? clojure.lang.ExceptionInfo #"timed out"
+                                (deref f 3000 :hung)))))
+      (finally
+        (tc/set-stream-error-handler! println))))
+  (testing "all-fail outcome is reported on every iteration, never nil"
+    (tc/set-stream-error-handler! (fn [& _]))
+    (try
+      (dotimes [_ 150]
+        (let [f (tc/fiber (sut/alts (throw (ex-info "boom" {}))
+                                    (throw (ex-info "boom2" {}))))]
+          (is (thrown? clojure.lang.ExceptionInfo (deref f 3000 :hung)))))
+      (finally
+        (tc/set-stream-error-handler! println))))))
 
 (deftest with-scope-invalid-max-parallelism-test
   (testing "with-scope :max-parallelism 0 is rejected instead of deadlocking"
