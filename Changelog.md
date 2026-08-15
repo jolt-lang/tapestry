@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.5.1
+
+Fixes a settlement race where `alts` could return `nil` instead of throwing.
+
+### Fixes
+
+- Fiber settlement (`interrupt!`, `timeout!`, and normal body completion)
+  delivered the result promise before recording scope state
+  (`first-error`/`first-result`), so `alts` could resume from `await-all!`
+  in that window and return `nil` instead of the result or error. All
+  settlement paths now go through a per-fiber `settle!` CAS that records
+  scope state before delivering the promise.
+- A fiber body completing before its `Fiber` object was installed could
+  report a `nil` fiber to the scope. The fiber holder is now a promise, so
+  the body blocks until the fiber exists.
+- Test timing margins widened for slow CI runners (`periodically-test`,
+  `alive?-test`).
+
 ## 0.5.0
 
 Port to Jolt (Clojure on Chez Scheme) plus a round of concurrency fixes found
